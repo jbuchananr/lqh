@@ -37,7 +37,11 @@ class TestPromptSession:
 
     def test_layout_keeps_status_below_input(self, app: LqhApp) -> None:
         application = app._create_application()
-        assert len(application.layout.container.children) == 5
+        children = application.layout.container.children
+        assert len(children) == 6
+        # The status bar must be the last child so it stays pinned at the
+        # bottom below the input row and the dataset-hint row.
+        assert children[-1].content.text == app._get_status_text  # type: ignore[attr-defined]
 
     async def test_plain_ask_user_prompt_stays_in_managed_area(self, app: LqhApp) -> None:
         task = asyncio.create_task(
