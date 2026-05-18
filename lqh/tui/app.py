@@ -52,6 +52,8 @@ TUI_STYLE = Style.from_dict({
     "input-border": "#444444",
     "input-prompt": "bold #888888",
     "input-area": "bg:#16202a #f5f7fa",
+    "dataset-hint.dim": "#555555",
+    "dataset-hint.key": "#4a9c70",
 })
 
 OTHER_OPTION = "Other (please specify)"
@@ -90,6 +92,7 @@ class LqhApp:
         self._ask_user_checked: set[int] = set()
         self._dataset_viewer: DatasetViewer | None = None
         self._dataset_viewer_future: asyncio.Future[str] | None = None
+        self._dataset_hint_visible = True
         self._input_queue: asyncio.Queue[str] = asyncio.Queue()
         self._session: Session | None = None
         self._agent: Agent | None = None
@@ -156,6 +159,16 @@ class LqhApp:
 
         input_row = VSplit([input_label, input_window])
 
+        dataset_hint_window = ConditionalContainer(
+            content=Window(
+                height=1,
+                content=FormattedTextControl(self._get_dataset_hint_text),
+            ),
+            filter=Condition(
+                lambda: self._dataset_viewer is not None and self._dataset_hint_visible
+            ),
+        )
+
         input_pad_bottom = Window(
             height=1,
             content=FormattedTextControl(
@@ -169,6 +182,7 @@ class LqhApp:
         not_auto = Condition(lambda: not self.auto_mode)
         hidden_input_pad_top = ConditionalContainer(content=input_pad_top, filter=not_auto)
         hidden_input_row = ConditionalContainer(content=input_row, filter=not_auto)
+        hidden_dataset_hint = ConditionalContainer(content=dataset_hint_window, filter=not_auto)
         hidden_input_pad_bottom = ConditionalContainer(content=input_pad_bottom, filter=not_auto)
 
         status_window = Window(
@@ -181,6 +195,7 @@ class LqhApp:
                 managed_window,
                 hidden_input_pad_top,
                 hidden_input_row,
+                hidden_dataset_hint,
                 hidden_input_pad_bottom,
                 status_window,
             ]),
@@ -284,6 +299,11 @@ class LqhApp:
         def _dataset_escape(event):
             asyncio.get_event_loop().create_task(self._close_dataset_viewer())
 
+        @kb.add("?", filter=is_dataset_mode, eager=True)
+        def _dataset_toggle_hint(event):
+            self._dataset_hint_visible = not self._dataset_hint_visible
+            event.app.invalidate()
+
         return kb
 
     def _create_application(self) -> Application:
@@ -306,6 +326,24 @@ class LqhApp:
         else:
             label = " > "
         return FormattedText([("class:input-prompt", label)])
+
+    def _get_dataset_hint_text(self) -> FormattedText:
+        """Render the dataset-mode keyboard-shortcut hint shown below `ds>`."""
+        return FormattedText([
+            ("class:dataset-hint.dim", "       "),
+            ("class:dataset-hint.key", "n"),
+            ("class:dataset-hint.dim", " next  "),
+            ("class:dataset-hint.key", "p"),
+            ("class:dataset-hint.dim", " prev  "),
+            ("class:dataset-hint.key", "r"),
+            ("class:dataset-hint.dim", " random  "),
+            ("class:dataset-hint.key", "q"),
+            ("class:dataset-hint.dim", "/"),
+            ("class:dataset-hint.key", "Esc"),
+            ("class:dataset-hint.dim", " close  ·  "),
+            ("class:dataset-hint.key", "?"),
+            ("class:dataset-hint.dim", " hide hints"),
+        ])
 
     def _get_status_text(self) -> FormattedText:
         """Render the status bar, with mode hints when applicable."""
@@ -334,6 +372,8 @@ class LqhApp:
             parts.extend([
                 ("class:status.separator", " │ "),
                 ("class:status.spinner", "n/p/r/q dataset"),
+                ("class:status.separator", " │ "),
+                ("class:status", "? " + ("hide" if self._dataset_hint_visible else "show") + " hints"),
             ])
 
         return FormattedText(parts)
@@ -579,6 +619,11 @@ class LqhApp:
 
     async def _handle_input(self, text: str) -> bool:
         """Handle one line of user input. Returns False to exit."""
+        if text.strip().lower() in {"exit", "quit"}:
+            self._save_session()
+            self._request_shutdown()
+            return False
+
         if is_command(text):
             return await self._handle_command(text)
 
@@ -589,7 +634,7 @@ class LqhApp:
         """Handle a slash command."""
         command, _args = parse_command(text)
 
-        if command == "/quit":
+        if command in {"/quit", "/q", "/exit"}:
             self._save_session()
             self._request_shutdown()
             return False

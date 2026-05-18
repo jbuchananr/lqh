@@ -30,6 +30,8 @@ COMMANDS: list[SlashCommand] = [
     SlashCommand("/prompt", "Start prompt optimization mode"),
     SlashCommand("/help", "Show available commands"),
     SlashCommand("/quit", "Exit lqh"),
+    SlashCommand("/exit", "Exit lqh"),
+    SlashCommand("/q", "Exit lqh"),
 ]
 
 
