@@ -75,6 +75,23 @@ class MyPipeline(Pipeline):
 - **The `client` is pre-configured.** Do not construct your own `AsyncOpenAI`. Auth, base URL, timeouts, and rate limiting are handled by the engine.
 - **Available imports:** `lqh.pipeline` (all pipeline types), `liquidrandom`, `json`, `random`, `base64`, `pathlib.Path`. Standard library modules are fine. Do not import external packages beyond these.
 
+### Handling `message.content = None`
+
+`resp.choices[0].message.content` can be `None` even on an otherwise successful response (some upstream models return an empty content field). Calling `.strip()` on `None` raises `AttributeError`, which the engine treats as a code bug and aborts the whole run — not transient, not retried. This is **not** a bug in your pipeline.
+
+Use the `safe_content` helper from `lqh.pipeline`:
+
+```python
+from lqh.pipeline import safe_content, GenerationError
+
+resp = await client.chat.completions.create(...)
+text = safe_content(resp).strip()
+if not text:
+    raise GenerationError("empty response")
+```
+
+Wrap the step with `@step(retries=3)` so `GenerationError` triggers a retry transparently. The examples below use the raw `.content.strip()` form for brevity, but production pipelines should prefer `safe_content`.
+
 ## Model Selection Guide
 
 The `client` is an `AsyncOpenAI` instance pointed at `api.lqh.ai`. Use these model strings:

@@ -8,9 +8,17 @@ You are now in **model evaluation** mode. Your goal is to benchmark different Li
 
 You will:
 1. Discover available LFMs with `list_models`
-2. Run zero-shot baselines on 2-4 models with `run_scoring` (mode=model_eval)
+2. Run baselines on 2-4 models with `run_scoring` (mode=model_eval), **always passing a baseline system prompt** (see "System prompts" below)
 3. Compare results and present a recommendation
 4. Suggest next steps: prompt optimization or fine-tuning
+
+## System prompts for baseline eval
+
+**Always pass a system prompt when evaluating a non-fine-tuned base model.** Small base models (1B–3B) score near zero without task instructions — that's a confused model, not a meaningful baseline.
+
+- If `prompts/{task}_v0.md` exists, pass `system_prompt_path="prompts/{task}_v0.md"`.
+- Otherwise, derive a short prompt from `SPEC.md` and pass it as `inference_system_prompt="..."`.
+- A true no-prompt run is only useful as a lower-bound sanity check, never as the headline baseline.
 
 ## Scoring concepts
 
@@ -48,7 +56,8 @@ run_scoring(
     scorer="evals/scorers/{task}_v1.md",
     mode="model_eval",
     run_name="baseline_{model_id}",
-    inference_model="{model_id}"
+    inference_model="{model_id}",
+    system_prompt_path="prompts/{task}_v0.md",  # or inference_system_prompt="..."
 )
 ```
 
@@ -70,7 +79,7 @@ Recommend the best-performing model and suggest next steps.
 
 - **Use the same eval set across ALL runs.** Consistency is critical for fair comparison.
 - **Include pool models AND specific LFMs.** Pool models (`small`, `medium`) give a baseline; specific LFMs show which foundation model to customize.
-- **Run with no system prompt first** (zero-shot), then with a basic system prompt. This establishes the baseline before prompt optimization.
+- **Always provide a system prompt for baseline evaluation.** Without one, small base models (1B–3B) score near zero — that's a confused model, not a meaningful baseline, and the user will (rightly) be alarmed by the numbers. Use `prompts/{task}_v0.md` if it exists, otherwise derive a minimal prompt from `SPEC.md`. Reserve true no-prompt runs for lower-bound sanity checks only.
 
 ## Next Steps
 

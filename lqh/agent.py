@@ -231,7 +231,9 @@ class Agent:
         self.callbacks = callbacks or AgentCallbacks()
         self.context_stats = ContextStats()
         self.orchestration_model: str = "orchestration:2"
-        self.max_tool_calls_per_turn: int = 50  # safety cap to prevent runaway loops
+        # Safety cap on tool calls per turn. None disables the cap entirely
+        # (default). The E2E harness sets a strict integer cap explicitly.
+        self.max_tool_calls_per_turn: int | None = None
         self._client = None
         self._total_prompt_tokens = 0
         self._total_completion_tokens = 0
@@ -364,8 +366,13 @@ class Agent:
             # Auto-mode: terminate cleanly once exit_auto_mode was called
             if self._auto_exit is not None:
                 break
-            # Safety: break if too many tool calls in a single turn
-            if tool_calls_this_turn >= self.max_tool_calls_per_turn:
+            # Safety: break if too many tool calls in a single turn (only
+            # enforced when the cap has been explicitly set, e.g. by the E2E
+            # harness; disabled by default to allow long autonomous runs).
+            if (
+                self.max_tool_calls_per_turn is not None
+                and tool_calls_this_turn >= self.max_tool_calls_per_turn
+            ):
                 if self.callbacks.on_agent_message:
                     await self.callbacks.on_agent_message(
                         f"\n⚠️ Reached {self.max_tool_calls_per_turn} tool calls in this turn. "

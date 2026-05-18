@@ -74,7 +74,11 @@ not loosen the rubric just to pass; that defeats the point.
 ### Stage 5 — `baseline_eval`
 Load the `evaluation` skill. Run a zero-shot evaluation of the base model
 on the filtered validation set, using the prompting style implied by the
-spec (chat for chat tasks, tool-calling for tool-use tasks). Record the
+spec (chat for chat tasks, tool-calling for tool-use tasks). **Always
+supply a baseline system prompt** — use `prompts/{task}_v0.md` if it
+exists, otherwise generate a minimal one from `SPEC.md` and write it
+there before running. Without a system prompt the base model scores near
+zero and the comparison to later stages is uninformative. Record the
 baseline score — every later score is judged relative to it.
 
 ### Stage 6 — `sft_initial`
