@@ -588,9 +588,14 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         _tool(
             name="hf_push",
             description=(
-                "Push a local dataset to Hugging Face Hub. Creates the repo if it "
-                "does not exist (private by default). Requires HF_TOKEN env var. "
-                "User permission is requested before pushing."
+                "Push a local directory to Hugging Face Hub as either a dataset "
+                "(folder containing .parquet files) or a model (folder containing "
+                "config.json + *.safetensors/*.bin/*.ckpt/*.pt). The repo type is "
+                "auto-detected from the folder contents; pass repo_type to override. "
+                "If the folder contains a README.md, it is uploaded as the repo card "
+                "— this is the recommended way to attach documentation. Creates the "
+                "repo if it does not exist (private by default). Requires HF_TOKEN "
+                "env var. User permission is requested before pushing."
             ),
             parameters={
                 "type": "object",
@@ -598,16 +603,27 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
                     "local_path": {
                         "type": "string",
                         "description": (
-                            "Relative path to the local dataset directory "
-                            "(e.g. 'datasets/summarization_v1'). Must contain "
-                            "data.parquet."
+                            "Relative path to the local directory to push "
+                            "(e.g. 'datasets/summarization_v1' or "
+                            "'runs/sft-1/checkpoints/step_500'). Must be a folder "
+                            "containing either parquet files (dataset) or HF-style "
+                            "model files (config.json + weights)."
+                        ),
+                    },
+                    "repo_type": {
+                        "type": "string",
+                        "enum": ["dataset", "model"],
+                        "description": (
+                            "Override the auto-detected repo type. By default the "
+                            "type is inferred from the folder contents (parquet → "
+                            "dataset, config.json/weights → model)."
                         ),
                     },
                     "repo_id": {
                         "type": "string",
                         "description": (
                             "HF repo ID (e.g. 'username/my-dataset'). If omitted, "
-                            "auto-generated from HF username + project dir + dataset "
+                            "auto-generated from HF username + project dir + folder "
                             "name. Use hf_repo_info first to discover your username."
                         ),
                     },
@@ -622,7 +638,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
                         "type": "string",
                         "description": (
                             "Dataset split name (e.g. 'train', 'test', 'validation'). "
-                            "Defaults to 'train'."
+                            "Defaults to 'train'. Only applies when repo_type=dataset."
                         ),
                         "default": "train",
                     },
@@ -630,7 +646,8 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
                         "type": "string",
                         "description": (
                             "Dataset config/subset name. Use this to push multiple "
-                            "related datasets as subsets of a single HF repo."
+                            "related datasets as subsets of a single HF repo. Only "
+                            "applies when repo_type=dataset."
                         ),
                     },
                     "commit_message": {

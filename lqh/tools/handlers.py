@@ -1266,10 +1266,34 @@ async def handle_hf_pull(
         return ToolResult(content=f"Error downloading {repo_id}: {e}{hint}")
 
 
+_MODEL_WEIGHT_GLOBS = ("*.safetensors", "*.bin", "*.ckpt", "*.pt", "*.pth")
+
+
+def _detect_hf_repo_type(target: Path) -> tuple[str | None, list[str], list[str]]:
+    """Inspect a folder and decide whether it looks like a dataset or a model.
+
+    Returns (repo_type, parquet_files, model_files). repo_type is None when
+    detection is ambiguous (both sets non-empty) or empty (neither found).
+    """
+    parquet_files = [p.name for p in target.glob("*.parquet")]
+    model_files: list[str] = []
+    if (target / "config.json").exists():
+        model_files.append("config.json")
+    for pattern in _MODEL_WEIGHT_GLOBS:
+        model_files.extend(p.name for p in target.glob(pattern))
+
+    if parquet_files and not model_files:
+        return "dataset", parquet_files, model_files
+    if model_files and not parquet_files:
+        return "model", parquet_files, model_files
+    return None, parquet_files, model_files
+
+
 async def handle_hf_push(
     project_dir: Path,
     *,
     local_path: str,
+    repo_type: str | None = None,
     repo_id: str | None = None,
     private: bool = True,
     split: str = "train",
@@ -1277,7 +1301,7 @@ async def handle_hf_push(
     commit_message: str | None = None,
     **kwargs: Any,
 ) -> ToolResult:
-    """Push a local dataset to HF Hub. Requires permission."""
+    """Push a local dataset or model checkpoint to HF Hub. Requires permission."""
     # Check HF token first
     try:
         api = _get_hf_api()
@@ -1288,19 +1312,46 @@ async def handle_hf_push(
     target = _validate_path(project_dir, local_path)
     if not target.exists():
         return ToolResult(content=f"Error: '{local_path}' does not exist")
+    if not target.is_dir():
+        return ToolResult(
+            content=f"Error: '{local_path}' is not a directory. hf_push expects a folder containing either parquet files (dataset) or model files (config.json + weights)."
+        )
 
-    # Find parquet file(s)
-    if target.is_dir():
-        parquet_files = list(target.glob("*.parquet"))
-        if not parquet_files:
-            return ToolResult(content=f"Error: no .parquet files in '{local_path}'")
-        # Use data.parquet if it exists, otherwise first parquet
-        data_parquet = target / "data.parquet"
-        parquet_path = data_parquet if data_parquet.exists() else parquet_files[0]
-    elif target.suffix == ".parquet":
-        parquet_path = target
+    if repo_type is not None and repo_type not in ("dataset", "model"):
+        return ToolResult(content=f"Error: invalid repo_type '{repo_type}' (must be 'dataset' or 'model')")
+
+    detected, parquet_files, model_files = _detect_hf_repo_type(target)
+
+    if repo_type is None:
+        if detected is None:
+            if parquet_files and model_files:
+                return ToolResult(
+                    content=(
+                        f"Error: '{local_path}' contains both parquet files and model files — "
+                        f"cannot auto-detect repo type. Pass repo_type='dataset' or repo_type='model' to disambiguate."
+                    )
+                )
+            return ToolResult(
+                content=(
+                    f"Error: '{local_path}' is not recognizable as a dataset or model folder. "
+                    f"Expected either .parquet files or HF-style model files "
+                    f"(config.json, *.safetensors, *.bin, *.ckpt, *.pt, *.pth)."
+                )
+            )
+        repo_type = detected
     else:
-        return ToolResult(content=f"Error: '{local_path}' is not a parquet file or directory containing one")
+        # Validate explicit override against what we found.
+        if repo_type == "dataset" and not parquet_files:
+            return ToolResult(
+                content=f"Error: repo_type='dataset' but no .parquet files found in '{local_path}'."
+            )
+        if repo_type == "model" and not model_files:
+            return ToolResult(
+                content=(
+                    f"Error: repo_type='model' but '{local_path}' has no model files "
+                    f"(config.json, *.safetensors, *.bin, *.ckpt, *.pt, *.pth)."
+                )
+            )
 
     # Auto-generate repo_id if not provided
     if repo_id is None:
@@ -1311,23 +1362,23 @@ async def handle_hf_push(
             return ToolResult(content=f"Error getting HF username: {e}")
 
         project_name = project_dir.name
-        dataset_name = target.name if target.is_dir() else target.parent.name
-        repo_id = f"{username}/{project_name}-{dataset_name}"
+        repo_id = f"{username}/{project_name}-{target.name}"
 
     # Check permission
     from lqh.tools.permissions import check_hf_permission
 
     if not check_hf_permission(project_dir, repo_id):
+        details = f"  Split: {split}\n" if repo_type == "dataset" else ""
         return ToolResult(
             content="PERMISSION_REQUIRED",
             requires_user_input=True,
             question=(
-                f"The agent wants to push data to Hugging Face Hub:\n"
+                f"The agent wants to push to Hugging Face Hub:\n"
                 f"  Local: {local_path}\n"
-                f"  Repo:  {repo_id}\n"
+                f"  Repo:  {repo_id} ({repo_type})\n"
                 f"  Private: {private}\n"
-                f"  Split: {split}\n\n"
-                f"Allow push?"
+                f"{details}"
+                f"\nAllow push?"
             ),
             options=[
                 "Push once, ask again next time",
@@ -1337,14 +1388,22 @@ async def handle_hf_push(
             ],
         )
 
-    # Execute the push
-    return await _execute_hf_push(
-        project_dir, parquet_path, local_path, repo_id, private, split, subset, commit_message, api,
+    # Dispatch
+    if repo_type == "dataset":
+        # Use data.parquet if it exists, otherwise first parquet
+        data_parquet = target / "data.parquet"
+        parquet_path = data_parquet if data_parquet.exists() else target / parquet_files[0]
+        return await _execute_hf_push_dataset(
+            project_dir, target, parquet_path, local_path, repo_id, private, split, subset, commit_message, api,
+        )
+    return await _execute_hf_push_model(
+        project_dir, target, local_path, repo_id, private, commit_message, api,
     )
 
 
-async def _execute_hf_push(
+async def _execute_hf_push_dataset(
     project_dir: Path,
+    target: Path,
     parquet_path: Path,
     local_path: str,
     repo_id: str,
@@ -1354,7 +1413,7 @@ async def _execute_hf_push(
     commit_message: str | None,
     api,
 ) -> ToolResult:
-    """Actually push to HF after permission is granted."""
+    """Push a parquet dataset (and optional README.md) to HF Hub."""
     try:
         import datasets as ds_lib
 
@@ -1378,6 +1437,20 @@ async def _execute_hf_push(
 
         dataset.push_to_hub(**push_kwargs)
 
+        # Dataset.push_to_hub does not pick up a user-authored README.md, so
+        # upload it separately if present.
+        readme_path = target / "README.md"
+        readme_note = ""
+        if readme_path.is_file():
+            api.upload_file(
+                path_or_fileobj=str(readme_path),
+                path_in_repo="README.md",
+                repo_id=repo_id,
+                repo_type="dataset",
+                commit_message=commit_message or "Update README.md",
+            )
+            readme_note = "\n  README: uploaded"
+
         # Save mapping
         _save_hf_mapping(project_dir, local_path, repo_id, "dataset", split)
 
@@ -1385,11 +1458,62 @@ async def _execute_hf_push(
         visibility = "private" if private else "public"
         return ToolResult(
             content=(
-                f"✅ Pushed to HF Hub\n"
+                f"✅ Pushed dataset to HF Hub\n"
                 f"  Repo:  {repo_id} ({visibility})\n"
                 f"  Split: {split}\n"
-                f"  Rows:  {len(dataset):,}\n"
+                f"  Rows:  {len(dataset):,}"
+                f"{readme_note}\n"
                 f"  URL:   {url}"
+            )
+        )
+
+    except Exception as e:
+        error_msg = str(e)
+        if "401" in error_msg or "403" in error_msg:
+            hint = " Your HF_TOKEN may not have write access. Check token permissions at https://huggingface.co/settings/tokens"
+        else:
+            hint = ""
+        return ToolResult(content=f"Error pushing to {repo_id}: {e}{hint}")
+
+
+async def _execute_hf_push_model(
+    project_dir: Path,
+    target: Path,
+    local_path: str,
+    repo_id: str,
+    private: bool,
+    commit_message: str | None,
+    api,
+) -> ToolResult:
+    """Push a model checkpoint folder (weights, config, tokenizer, README) to HF Hub."""
+    try:
+        api.create_repo(repo_id=repo_id, repo_type="model", private=private, exist_ok=True)
+
+        api.upload_folder(
+            folder_path=str(target),
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message=commit_message or f"Push checkpoint from {target.name}",
+        )
+
+        _save_hf_mapping(project_dir, local_path, repo_id, "model")
+
+        # Count files for the summary (top-level + nested, excluding hidden dirs).
+        file_count = sum(
+            1 for p in target.rglob("*")
+            if p.is_file() and not any(part.startswith(".") for part in p.relative_to(target).parts)
+        )
+        has_readme = (target / "README.md").is_file()
+
+        url = f"https://huggingface.co/{repo_id}"
+        visibility = "private" if private else "public"
+        return ToolResult(
+            content=(
+                f"✅ Pushed model to HF Hub\n"
+                f"  Repo:   {repo_id} ({visibility})\n"
+                f"  Files:  {file_count}"
+                f"{' (incl. README.md)' if has_readme else ''}\n"
+                f"  URL:    {url}"
             )
         )
 
