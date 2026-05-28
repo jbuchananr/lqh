@@ -726,6 +726,29 @@ class Agent:
             else:
                 return ToolResult(content="[No user input handler available]")
 
+        # Handle first-run compute picker. start_training / start_local_eval
+        # surface this when no remote is set and no default has been chosen.
+        # We prompt the user via on_ask_user, save their choice via
+        # lqh.remote.compute, and re-invoke the original tool with the
+        # resolved remote so the user sees their training actually start
+        # rather than just a "saved your preference" toast.
+        if result.requires_user_input and result.content == "COMPUTE_PICK_REQUIRED":
+            if self.auto_mode:
+                # Auto mode: default to Cloud silently. The user wasn't
+                # going to answer the prompt anyway, and Cloud is the
+                # zero-setup path.
+                from lqh.remote.compute import save_global_default
+                save_global_default("cloud")
+                return await self._reinvoke_with_remote(tool_name, arguments, "cloud")
+            if self.callbacks.on_ask_user:
+                user_response = await self.callbacks.on_ask_user(
+                    result.question or "", result.options
+                )
+                return await self._handle_compute_pick_response(
+                    user_response, tool_name, arguments
+                )
+            return ToolResult(content="[No user input handler available]")
+
         # Handle permission request (pipeline execution or HF push)
         if result.requires_user_input and result.content == "PERMISSION_REQUIRED":
             # Auto mode: auto-grant project-wide so the pipeline never blocks.
@@ -751,6 +774,61 @@ class Agent:
                 return ToolResult(content=viewer_summary)
 
         return result
+
+    async def _reinvoke_with_remote(
+        self, tool_name: str, tool_args: dict, remote: str
+    ) -> ToolResult:
+        """Re-call the original tool now that we have a compute target.
+
+        Bypasses ``_call_tool`` so we don't loop forever if for some
+        reason the picker check still fires (it won't, since the value
+        is now persisted, but defense in depth).
+        """
+        from lqh.tools.handlers import execute_tool
+        new_args = dict(tool_args)
+        new_args["remote"] = remote
+        extra: dict[str, Any] = {"api_key": self.api_key}
+        if tool_name in ("start_training", "start_local_eval"):
+            extra["on_background_task_started"] = self.callbacks.on_background_task_started
+        return await execute_tool(tool_name, new_args, self.project_dir, **extra)
+
+    async def _handle_compute_pick_response(
+        self, response: str, tool_name: str, tool_args: dict
+    ) -> ToolResult:
+        """User picked cloud or BYO in the first-run dialog.
+
+        Cloud → save the global default and re-run the tool with
+        ``remote="cloud"``.
+
+        BYO → return guidance asking the LLM to drive the user through
+        the existing remote_add / remote_bind / remote_setup flow.
+        Saving the SSH default is deferred until a remote actually
+        exists (no point persisting ``ssh:foo`` before ``foo`` is
+        configured).
+        """
+        from lqh.remote.compute import save_global_default
+
+        # Normalize: accept partial matches so the LLM/UI text rendering
+        # of the choice doesn't have to match exactly.
+        lower = response.lower()
+        if "cloud" in lower:
+            save_global_default("cloud")
+            return await self._reinvoke_with_remote(tool_name, arguments=tool_args, remote="cloud")
+
+        # BYO path. Don't save yet; the agent has to walk the user
+        # through remote_add + remote_bind + remote_setup first.
+        return ToolResult(content=(
+            "The user prefers bring-your-own compute. Walk them through "
+            "setting up an SSH remote:\n"
+            "  1. Ask for the hostname (SSH alias or user@host) and the "
+            "remote_root path on that machine.\n"
+            "  2. Call remote_add with the chosen name + hostname.\n"
+            "  3. Call remote_bind with the name + remote_root for this project.\n"
+            "  4. Call remote_setup to provision the venv.\n"
+            "  5. Call compute_set(scope='project', value=f'ssh:<name>') so "
+            "future runs auto-route there.\n"
+            "  6. Re-issue the original training command with remote='<name>'."
+        ))
 
     async def _handle_permission_response(
         self, response: str, tool_name: str, tool_args: dict

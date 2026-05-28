@@ -658,6 +658,52 @@ async def handle_ask_user(
     )
 
 
+async def handle_compute_set(
+    project_dir: Path,
+    *,
+    value: str,
+    scope: str = "global",
+    **kwargs: Any,
+) -> ToolResult:
+    """Persist the user's default compute target.
+
+    Parameters
+    ----------
+    value : str
+        ``"cloud"`` for LQH Cloud, ``"ssh:<name>"`` for a previously-bound
+        SSH remote, or empty string to clear.
+    scope : str
+        ``"global"`` writes ``~/.lqh/config.json`` (default — affects every
+        project). ``"project"`` writes ``<project>/.lqh/compute.json``
+        (overrides the global default for this project only).
+    """
+    from lqh.remote.compute import save_global_default, save_project_default
+
+    if scope not in ("global", "project"):
+        return ToolResult(content=f"Error: scope must be 'global' or 'project', got {scope!r}")
+
+    value = (value or "").strip()
+    if value == "":
+        # Clear.
+        if scope == "global":
+            save_global_default(None)
+        else:
+            save_project_default(project_dir, None)
+        return ToolResult(content=f"Cleared default compute ({scope}).")
+
+    # Validate the shape — clearer to fail here than at /train time.
+    if value != "cloud" and not value.startswith("ssh:"):
+        return ToolResult(content=(
+            f"Error: value must be 'cloud' or 'ssh:<remote_name>', got {value!r}."
+        ))
+
+    if scope == "global":
+        save_global_default(value)
+        return ToolResult(content=f"✅ Default compute set to '{value}' (global).")
+    save_project_default(project_dir, value)
+    return ToolResult(content=f"✅ Default compute set to '{value}' for this project.")
+
+
 async def handle_show_file(project_dir: Path, *, path: str, **kwargs: Any) -> ToolResult:
     """Show a file to the user in scrollable view. Returns truncated version to agent."""
     target = _validate_path(project_dir, path)
@@ -1529,6 +1575,80 @@ async def _execute_hf_push_dataset(
         return ToolResult(content=f"Error pushing to {repo_id}: {e}{hint}")
 
 
+def _looks_like_hub_id(value: str) -> bool:
+    """Hub ids are ``owner/name``; local paths usually contain ``/`` and a
+    file separator (``..``, ``./``, drive letter, or an actual existing
+    path). This is a heuristic, not a verifier — the worst case is the
+    user gets a clear error from the HF SDK when the id doesn't resolve.
+    """
+    if not value or value.startswith((".", "/", "~")) or ":" in value:
+        return False
+    parts = value.split("/")
+    return len(parts) == 2 and all(parts) and not Path(value).exists()
+
+
+def _prepare_adapter_for_upload(
+    target: Path, repo_id: str,
+) -> tuple[bool, str | None]:
+    """If ``target`` is a PEFT adapter dir, normalise its metadata for
+    a clean HF Hub upload.
+
+    Returns ``(is_adapter, base_model_id)``. When ``is_adapter`` is True:
+      - validates that ``adapter_config.json`` carries a hub-shaped
+        ``base_model_name_or_path`` (if it's a sandbox-local path the
+        upload would dangle; we raise so the caller surfaces a clear
+        error)
+      - writes a minimal README.md tagging the upload as a peft adapter
+        if one isn't already present.
+    For merged dirs returns ``(False, None)`` and does nothing.
+    """
+    cfg_path = target / "adapter_config.json"
+    if not cfg_path.is_file():
+        return False, None
+
+    try:
+        cfg = json.loads(cfg_path.read_text())
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"{cfg_path} is not valid JSON ({exc}); cannot push adapter"
+        ) from exc
+    base = cfg.get("base_model_name_or_path")
+    if not base:
+        raise RuntimeError(
+            f"{cfg_path} has no 'base_model_name_or_path'; cannot push "
+            f"adapter without naming the base model. Edit the file to "
+            f"set base_model_name_or_path to a hub id."
+        )
+    if not _looks_like_hub_id(base):
+        raise RuntimeError(
+            f"{cfg_path}: base_model_name_or_path={base!r} doesn't look "
+            f"like a hub id (owner/name). The adapter would dangle on "
+            f"HF Hub. Edit the file to point at the published base."
+        )
+
+    readme = target / "README.md"
+    if not readme.exists():
+        readme.write_text(
+            "---\n"
+            "library_name: peft\n"
+            f"base_model: {base}\n"
+            "tags:\n"
+            "- peft\n"
+            "- lora\n"
+            "---\n\n"
+            f"# {repo_id}\n\n"
+            "LoRA adapter trained with [lqh](https://github.com/Liquid4All/lqh).\n\n"
+            "## Loading\n\n"
+            "```python\n"
+            "from transformers import AutoModelForCausalLM\n"
+            "from peft import PeftModel\n\n"
+            f'base = AutoModelForCausalLM.from_pretrained("{base}")\n'
+            f'model = PeftModel.from_pretrained(base, "{repo_id}")\n'
+            "```\n"
+        )
+    return True, base
+
+
 async def _execute_hf_push_model(
     project_dir: Path,
     target: Path,
@@ -1538,7 +1658,18 @@ async def _execute_hf_push_model(
     commit_message: str | None,
     api,
 ) -> ToolResult:
-    """Push a model checkpoint folder (weights, config, tokenizer, README) to HF Hub."""
+    """Push a model checkpoint folder (weights, config, tokenizer, README) to HF Hub.
+
+    Adapter dirs (containing ``adapter_config.json``) get their
+    base-model metadata validated and a peft-tagged README synthesized
+    when one isn't already present, so a downstream consumer can find
+    the base model and load via ``PeftModel.from_pretrained``.
+    """
+    try:
+        is_adapter, base_model = _prepare_adapter_for_upload(target, repo_id)
+    except RuntimeError as exc:
+        return ToolResult(content=f"Error preparing adapter for upload: {exc}")
+
     try:
         api.create_repo(repo_id=repo_id, repo_type="model", private=private, exist_ok=True)
 
@@ -1560,10 +1691,12 @@ async def _execute_hf_push_model(
 
         url = f"https://huggingface.co/{repo_id}"
         visibility = "private" if private else "public"
+        adapter_note = f"\n  Kind:   PEFT adapter (base: {base_model})" if is_adapter else ""
         return ToolResult(
             content=(
                 f"✅ Pushed model to HF Hub\n"
-                f"  Repo:   {repo_id} ({visibility})\n"
+                f"  Repo:   {repo_id} ({visibility})"
+                f"{adapter_note}\n"
                 f"  Files:  {file_count}"
                 f"{' (incl. README.md)' if has_readme else ''}\n"
                 f"  URL:    {url}"
@@ -1616,6 +1749,59 @@ def _next_run_name(project_dir: Path, prefix: str) -> str:
     return f"{prefix}_{next_num:03d}"
 
 
+def _pick_compute_or_use(
+    project_dir: Path, explicit: str | None
+) -> ToolResult | str | None:
+    """Resolve the compute target with the precedence in lqh.remote.compute.
+
+    Returns one of:
+      * ``ToolResult`` — when the agent needs to ask the user (the
+        COMPUTE_PICK_REQUIRED sentinel). The caller MUST return this
+        result up to the agent loop unchanged.
+      * ``str`` — the resolved target (``"cloud"`` or ``"ssh:<name>"`` or
+        a bare SSH remote name for legacy callers).
+      * ``None`` — no compute requested and resolver says local (we
+        treat that as "stay local", matching the historical default
+        when ``remote=None``).
+
+    Why this returns either a ToolResult or a string: keeps the picker
+    branch out of every caller's body. Each handler that wants to
+    "route to cloud/ssh on first-run pick" just does::
+
+        decision = _pick_compute_or_use(project_dir, remote)
+        if isinstance(decision, ToolResult):
+            return decision
+        remote = decision  # may still be None (= run local)
+    """
+    from lqh.remote.compute import resolve_compute
+
+    resolved = resolve_compute(project_dir, explicit=explicit)
+    if resolved is not None:
+        return resolved
+    # Nothing set anywhere and nothing explicitly requested. Without
+    # the picker we'd silently run locally, but since the user is
+    # asking the agent to start a training run, this is the right
+    # moment to ask them whether to use cloud or BYO. The agent loop
+    # special-cases ``content="COMPUTE_PICK_REQUIRED"`` to: prompt the
+    # user → persist the choice → re-invoke this tool with the right
+    # ``remote=``.
+    return ToolResult(
+        content="COMPUTE_PICK_REQUIRED",
+        requires_user_input=True,
+        question=(
+            "Where should training and GPU eval run?\n\n"
+            "  • LQH Cloud — zero setup, pay-per-second, runs on api.lqh.ai.\n"
+            "  • Bring your own compute — connect an SSH-accessible GPU box.\n\n"
+            "Your pick is saved as the default for future runs and can be "
+            "changed any time with compute_set."
+        ),
+        options=[
+            "LQH Cloud (recommended)",
+            "Bring my own compute",
+        ],
+    )
+
+
 async def handle_start_training(
     project_dir: Path,
     *,
@@ -1661,6 +1847,16 @@ async def handle_start_training(
     ``enable_sweep=false``; under sweep they are overridden by the grid.
     """
     from lqh.tools.permissions import check_permission
+
+    # First-run picker: when the agent didn't pass an explicit
+    # ``remote=`` and the user hasn't set a default-compute yet, bubble
+    # the picker question up so the agent can ask the user. After the
+    # user picks, the agent loop saves the choice and re-invokes this
+    # tool with the resolved ``remote=`` filled in.
+    decision = _pick_compute_or_use(project_dir, remote)
+    if isinstance(decision, ToolResult):
+        return decision
+    remote = decision
 
     # Check torch + GPU only when running locally; remote execution has its
     # own venv (provisioned by remote_setup) and its own GPUs.
@@ -1819,14 +2015,64 @@ async def _execute_start_training_remote(
     on_bg_started: Callable[[str, str, str, str | None], None] | None = None,
     module: str = "lqh.train",
 ) -> ToolResult:
-    """Start training on a remote backend."""
+    """Start training on a remote backend.
+
+    Routes to ``CloudBackend`` when ``remote_name == "cloud"`` (or the
+    legacy ``"ssh:cloud"`` form); otherwise looks up an SSH remote by
+    name and uses ``SSHDirectBackend``.
+    """
+    from lqh.remote.compute import is_cloud, ssh_remote_name
+    from lqh.remote.backend import RemoteConfig
+
+    # --- Cloud path ---
+    if is_cloud(remote_name):
+        from lqh.remote.cloud import CloudBackend
+
+        cfg = RemoteConfig(
+            name="cloud",
+            type="cloud",
+            hostname="api.lqh.ai",  # informational; CloudBackend hits api_root()
+            remote_root="cloud:lqh",
+        )
+        backend = CloudBackend(cfg, project_dir)
+        try:
+            job_id = await backend.submit_run(str(run_dir), config, module=module)
+        except Exception as e:
+            return ToolResult(content=f"Error launching cloud training: {e}")
+
+        if on_bg_started is not None:
+            on_bg_started(run_name, "train", run_name, "cloud")
+
+        from lqh.project_log import append_event
+        inner = config.get("base_config", config) if config.get("type") == "sweep" else config
+        append_event(
+            project_dir,
+            "training_started",
+            f"Started {inner.get('type', 'training')} run {run_name} on LQH Cloud (job {job_id})",
+            run_name=run_name,
+            run_type=inner.get("type", "unknown"),
+            base_model=inner.get("base_model", ""),
+            remote="cloud",
+        )
+        return ToolResult(
+            content=(
+                f"🚀 Cloud training submitted\n"
+                f"  Run:     {run_name}\n"
+                f"  Type:    {config.get('type', 'unknown')}\n"
+                f"  Job ID:  {job_id}\n\n"
+                f"Backend: LQH Cloud (api.lqh.ai). Use training_status to monitor progress."
+            )
+        )
+
+    # --- SSH path (existing behavior) ---
     from lqh.remote.config import get_remote
     from lqh.remote.ssh_direct import SSHDirectBackend
 
-    remote_config = get_remote(project_dir, remote_name)
+    ssh_name = ssh_remote_name(remote_name) or remote_name
+    remote_config = get_remote(project_dir, ssh_name)
     if remote_config is None:
         return ToolResult(
-            content=f"Error: remote '{remote_name}' not found. Use remote_list to see configured remotes."
+            content=f"Error: remote '{ssh_name}' not found. Use remote_list to see configured remotes."
         )
 
     if remote_config.type == "ssh_slurm":
@@ -1841,7 +2087,7 @@ async def _execute_start_training_remote(
         return ToolResult(content=f"Error launching remote training: {e}")
 
     if on_bg_started is not None:
-        on_bg_started(run_name, "train", run_name, remote_name)
+        on_bg_started(run_name, "train", run_name, ssh_name)
 
     from lqh.project_log import append_event
 
@@ -1853,22 +2099,22 @@ async def _execute_start_training_remote(
     append_event(
         project_dir,
         "training_started",
-        f"Started {inner.get('type', 'training')} run {run_name} on remote '{remote_name}' (job {job_id})",
+        f"Started {inner.get('type', 'training')} run {run_name} on remote '{ssh_name}' (job {job_id})",
         run_name=run_name,
         run_type=inner.get("type", "unknown"),
         base_model=inner.get("base_model", ""),
-        remote=remote_name,
+        remote=ssh_name,
     )
 
     return ToolResult(
         content=(
-            f"🚀 Remote training started on '{remote_name}'\n"
+            f"🚀 Remote training started on '{ssh_name}'\n"
             f"  Run:      {run_name}\n"
             f"  Type:     {config['type']}\n"
             f"  Job ID:   {job_id}\n"
             f"  Host:     {remote_config.hostname}\n"
             f"  Dir:      {remote_run_dir}\n\n"
-            f"Use training_status(remote='{remote_name}') to monitor progress."
+            f"Use training_status(remote='{ssh_name}') to monitor progress."
         )
     )
 
@@ -2414,6 +2660,13 @@ async def handle_start_local_eval(
 ) -> ToolResult:
     """Start a local inference subprocess for model evaluation."""
     on_bg_started = kwargs.get("on_background_task_started")
+
+    # First-run picker — same gate as handle_start_training.
+    decision = _pick_compute_or_use(project_dir, remote)
+    if isinstance(decision, ToolResult):
+        return decision
+    remote = decision
+
     if remote:
         return await _start_local_eval_remote(
             project_dir, model_path, dataset, scorer, run_name, remote,
@@ -3187,6 +3440,7 @@ TOOL_HANDLERS: dict[str, Callable[..., Awaitable[ToolResult]]] = {
     "remote_remove_machine": handle_remote_remove_machine,
     "remote_setup": handle_remote_setup,
     "remote_status": handle_remote_status,
+    "compute_set": handle_compute_set,
     "exit_auto_mode": handle_exit_auto_mode,
     "set_auto_stage": handle_set_auto_stage,
 }

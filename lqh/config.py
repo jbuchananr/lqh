@@ -21,6 +21,11 @@ def default_api_base_url() -> str:
 class LqhConfig:
     api_key: str | None = None
     api_base_url: str = field(default_factory=default_api_base_url)
+    # Default compute target, used when neither the tool invocation nor
+    # a per-project ``.lqh/compute.json`` overrides it. One of:
+    # ``"cloud"`` (LQH Cloud), ``"ssh:<name>"`` (a configured SSH remote),
+    # or ``None`` (not yet chosen → first-run picker fires).
+    default_compute: str | None = None
 
 
 def config_dir() -> Path:
@@ -41,6 +46,7 @@ def load_config() -> LqhConfig:
     return LqhConfig(
         api_key=data.get("api_key"),  # type: ignore[arg-type]
         api_base_url=data.get("api_base_url", default_api_base_url()),  # type: ignore[arg-type]
+        default_compute=data.get("default_compute"),  # type: ignore[arg-type]
     )
 
 

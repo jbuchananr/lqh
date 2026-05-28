@@ -288,6 +288,112 @@ def _run_child(sub_run_dir: Path, sub_config: dict[str, Any]) -> int:
     return proc.returncode
 
 
+def _build_eval_of_best_config(base: dict[str, Any], run_dir: Path) -> dict[str, Any] | None:
+    """Compose the infer config the eval-of-best step runs against.
+
+    Returns None when there's nothing to evaluate against — either no
+    ``eval_dataset`` was supplied in the sweep's base config, or no
+    winner model has been materialized at ``run_dir/model`` yet.
+    """
+    eval_dataset = base.get("eval_dataset")
+    if not eval_dataset:
+        return None
+    model_path = run_dir / "model"
+    if not model_path.exists():
+        return None
+    # Build a minimal lqh.infer config that matches what the rest of
+    # the stack expects (matches the shape produced by
+    # handle_start_local_eval).
+    cfg: dict[str, Any] = {
+        "type": "infer",
+        "base_model": str(model_path.resolve()),
+        "dataset": eval_dataset,
+        "max_new_tokens": int(base.get("max_new_tokens", 4096)),
+        "manifest": ["base_model", "dataset"],
+    }
+    if scorer := base.get("scorer"):
+        cfg["scorer"] = scorer
+        cfg["manifest"].append("scorer")
+    if sp := base.get("system_prompt"):
+        cfg["system_prompt"] = sp
+    if rf := base.get("response_format"):
+        cfg["response_format"] = rf
+    return cfg
+
+
+def _run_eval_of_best(run_dir: Path, base: dict[str, Any]) -> dict[str, Any]:
+    """Run ``lqh.infer`` against the sweep's winner model and surface
+    the predictions at the run-dir level so the watcher scores them.
+
+    Self-contained: builds the infer config, runs it as a subprocess
+    in a ``eval_of_best/`` subdir (so its progress.jsonl / pid don't
+    collide with the sweep's), then symlinks the resulting
+    ``predictions.parquet`` + ``eval_request.json`` up to ``run_dir``
+    so the existing scoring loop picks them up without changes.
+
+    Returns a small summary dict for the sweep's final status payload
+    or ``{"skipped": "<reason>"}`` if eval was a no-op (no eval_dataset
+    in base config, no winner model, or infer subprocess crashed).
+    """
+    cfg = _build_eval_of_best_config(base, run_dir)
+    if cfg is None:
+        return {"skipped": "no eval_dataset or no winner model"}
+
+    eval_dir = run_dir / "eval_of_best"
+    eval_dir.mkdir(parents=True, exist_ok=True)
+    cfg_path = eval_dir / "config.json"
+    cfg_path.write_text(json.dumps(cfg, indent=2) + "\n")
+
+    print(f"sweep: starting eval-of-best on winner ({cfg['base_model']})", flush=True)
+    write_progress(
+        run_dir,
+        step=0,
+        extra={"phase": "eval_of_best_start", "dataset": cfg.get("dataset")},
+    )
+
+    log_path = eval_dir / "infer.log"
+    with log_path.open("w") as log:
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-m", "lqh.infer", str(cfg_path)],
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+            rc = proc.returncode
+        except FileNotFoundError as exc:
+            # Python missing — practically impossible since we're
+            # running under it, but defend against PATH oddities in
+            # restricted sandboxes anyway.
+            return {"skipped": f"failed to spawn infer subprocess: {exc}"}
+
+    if rc != 0:
+        print(f"sweep: eval-of-best failed (rc={rc}); see eval_of_best/infer.log", flush=True)
+        return {"skipped": f"infer subprocess exit code {rc}"}
+
+    # Surface predictions + eval_request at the run-dir level so the
+    # remote watcher's existing path detection scores them. Use
+    # symlinks (cheap, no duplicated disk) and fall back to copies
+    # on filesystems that reject symlinks.
+    for fname in ("predictions.parquet", "eval_request.json"):
+        src = eval_dir / fname
+        if not src.exists():
+            continue
+        dst = run_dir / fname
+        if dst.is_symlink() or dst.exists():
+            try:
+                dst.unlink()
+            except OSError:
+                pass
+        try:
+            dst.symlink_to(src.resolve())
+        except OSError:
+            import shutil
+            shutil.copy2(src, dst)
+
+    return {"ok": True, "dataset": cfg.get("dataset"), "model": cfg["base_model"]}
+
+
 def _materialize_best_model(winner_dir: Path, run_dir: Path) -> None:
     """Expose the winner's model directly as ``run_dir/model``.
 
@@ -458,12 +564,28 @@ def sweep_loop(run_dir: Path, sweep_config: dict[str, Any]) -> None:
         f"{proxy_key}={winner['primary']:.4f}",
         flush=True,
     )
+
+    # Eval-of-best: if the base config has an eval_dataset, run the
+    # winner against it now while the GPU is still warm. The result
+    # (predictions.parquet + eval_request.json at the run-dir level)
+    # gets scored by the host-side watcher / cloud SSE consumer
+    # exactly the same way a standalone start_local_eval would be.
+    #
+    # Gated by sweep_config["eval_best"] (default true so cloud runs
+    # produce a final score without a second submit; callers that
+    # only want the sweep can pass eval_best=false explicitly).
+    eval_summary: dict[str, Any] = {}
+    if sweep_config.get("eval_best", True):
+        eval_summary = _run_eval_of_best(run_dir, base)
+        print(f"sweep: eval-of-best summary: {eval_summary}", flush=True)
+
     write_status(
         run_dir, "completed",
         extra={
             "winner": winner["config_id"],
             "winner_primary": winner["primary"],
             "n_configs": len(rows),
+            "eval_of_best": eval_summary,
         },
     )
 

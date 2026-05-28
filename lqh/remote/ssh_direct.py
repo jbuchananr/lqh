@@ -5,9 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import shlex
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from lqh import auth as lqh_auth
+from lqh.config import default_api_base_url
 from lqh.remote.backend import JobStatus, RemoteBackend, RemoteConfig
 from lqh.remote.bootstrap import bootstrap_remote, check_hf_token
 from lqh.remote.ssh_helpers import rsync_pull, rsync_push, ssh_run
@@ -113,15 +116,36 @@ class SSHDirectBackend(RemoteBackend):
         remote_config_path = f"{remote_run_dir}/config.json"
         activate = f"source {self._remote_root}/.lqh-env/bin/activate"
 
-        # Source .env for HF_TOKEN
+        # Source .env for HF_TOKEN + (added Phase 0) LQH_API_TOKEN/LQH_BASE_URL
         env_file = f"{self._remote_root}/.lqh-env/.env"
         source_env = f"[ -f {env_file} ] && set -a && source {env_file} && set +a"
+
+        # Phase 0: write the local user's lqh bearer token + base URL into
+        # the remote .env so the publish step at end-of-run can call back
+        # to api.lqh.ai. Idempotent; updated on every submit so a user
+        # rotating their token via /login is reflected on the next run.
+        await self._configure_api_creds(env_file)
 
         # CUDA_VISIBLE_DEVICES
         cuda_env = ""
         if self.config.gpu_ids is not None:
             ids = ",".join(str(i) for i in self.config.gpu_ids)
             cuda_env = f"CUDA_VISIBLE_DEVICES={ids} "
+
+        # End-of-run publish step: uploads outputs/ to R2 via api.lqh.ai
+        # using LQH_API_TOKEN sourced above. Non-fatal — if publishing
+        # fails (e.g. R2 not configured yet on backend) the launcher
+        # still exits cleanly and the watcher continues to use the
+        # pre-Phase-0 rsync path. The progress.jsonl already on disk is
+        # the source of truth either way.
+        project_id = self.project_dir.name
+        publish_cmd = (
+            f"python -m lqh.remote.publish "
+            f"--project-id {shlex.quote(project_id)} "
+            f"{shlex.quote(remote_run_dir)} "
+            f">> {remote_run_dir}/stdout.log "
+            f"2>> {remote_run_dir}/stderr.log || true"
+        )
 
         # Write a launcher script on the remote to avoid quoting issues.
         launcher_script = (
@@ -131,6 +155,9 @@ class SSHDirectBackend(RemoteBackend):
             f"cd {self._remote_root}\n"
             f"{cuda_env}python -m {module} {remote_config_path} "
             f"> {remote_run_dir}/stdout.log 2> {remote_run_dir}/stderr.log\n"
+            f"# Publish artifacts to R2 (Phase 0). Always attempted, even on\n"
+            f"# training failure, so logs and partial metrics are preserved.\n"
+            f"{publish_cmd}\n"
         )
         launcher_path = f"{remote_run_dir}/launcher.sh"
         await ssh_run(
@@ -181,6 +208,37 @@ class SSHDirectBackend(RemoteBackend):
         )
 
         return pid
+
+    async def _configure_api_creds(self, env_file: str) -> None:
+        """Write LQH_API_TOKEN and LQH_BASE_URL into the remote .env file.
+
+        Same idempotent grep-replace pattern as ``configure_hf_token``.
+        Silent no-op if the local user isn't logged in — the publish
+        step will then exit with "no auth token available" and the
+        legacy rsync-back path keeps working.
+        """
+        token = lqh_auth.get_token()
+        base = default_api_base_url()
+        if not token:
+            return
+        # Build a single shell command so this is one SSH round trip.
+        # Quote values so funky characters (= signs in tokens, & in URLs)
+        # don't break the .env grammar.
+        token_q = shlex.quote(token)
+        base_q = shlex.quote(base)
+        cmd = (
+            f"touch {env_file} && "
+            f"grep -v '^LQH_API_TOKEN=' {env_file} | "
+            f"grep -v '^LQH_BASE_URL=' > {env_file}.tmp 2>/dev/null; "
+            f"echo LQH_API_TOKEN={token_q} >> {env_file}.tmp && "
+            f"echo LQH_BASE_URL={base_q} >> {env_file}.tmp && "
+            f"mv {env_file}.tmp {env_file}"
+        )
+        _, stderr, rc = await ssh_run(self._hostname, cmd, timeout=10.0)
+        if rc != 0:
+            # Don't fail the submit — publish will skip if the env isn't
+            # there. Log so an operator can diagnose.
+            logger.warning("failed to configure LQH api creds on remote: %s", stderr)
 
     async def _wait_for_pid(
         self,
@@ -297,7 +355,13 @@ class SSHDirectBackend(RemoteBackend):
         remote_run_dir: str,
         local_run_dir: str,
     ) -> None:
-        """Pull progress.jsonl and signal files from remote."""
+        """Pull progress.jsonl and signal files from remote.
+
+        Phase 0: also pull ``artifacts.json``, written by the end-of-run
+        publish step. The watcher reads it to discover which R2 handles
+        are available, so the agent can fetch checkpoints on demand
+        without rsync'ing them back over (possibly slow) SSH.
+        """
         await rsync_pull(
             self._hostname,
             remote_run_dir,
@@ -305,6 +369,7 @@ class SSHDirectBackend(RemoteBackend):
             include_patterns=[
                 "progress.jsonl",
                 "pid",
+                "artifacts.json",
                 # Run-root artifacts for one-shot inference (start_local_eval).
                 "eval_request.json",
                 "eval_result.json",

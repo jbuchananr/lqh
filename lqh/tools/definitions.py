@@ -1195,6 +1195,45 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
                 "required": ["name"],
             },
         ),
+        # ------------------------------------------------------------------
+        # compute_set
+        # ------------------------------------------------------------------
+        _tool(
+            name="compute_set",
+            description=(
+                "Persist the default compute target so future start_training "
+                "and start_local_eval calls auto-route without prompting. "
+                "Use this after the user has picked between LQH Cloud and "
+                "BYO compute, OR when they explicitly ask to switch (e.g. "
+                "'always run training on cloud from now on'). "
+                "value='cloud' selects LQH Cloud; value='ssh:<name>' "
+                "selects a previously-bound SSH remote. scope='global' "
+                "applies to all projects (default); scope='project' "
+                "overrides only this project."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "value": {
+                        "type": "string",
+                        "description": (
+                            "'cloud' or 'ssh:<remote_name>'. Pass an empty "
+                            "string to clear the current default."
+                        ),
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["global", "project"],
+                        "description": (
+                            "Where to write. 'global' (default) updates "
+                            "~/.lqh/config.json; 'project' updates "
+                            "<project>/.lqh/compute.json."
+                        ),
+                    },
+                },
+                "required": ["value"],
+            },
+        ),
     ]
 
     if not auto_mode:

@@ -396,22 +396,30 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
     # change). Symptom: training "runs" but at ~100× CPU speed.
     device_map = "auto" if torch.cuda.is_available() else None
 
-    # Load model and tokenizer
-    model = AutoModelForCausalLM.from_pretrained(
-        base_model,
-        dtype=dtype,
-        device_map=device_map,
+    # Load model and tokenizer through the unified loader. When
+    # base_model is an adapter dir (e.g. a SFT-with-merge=False output
+    # used as the continued-FT starting point), this transparently
+    # loads the underlying base, applies the adapter, and merges it
+    # into the weights so DPO can attach a fresh LoRA on top. For a
+    # hub id or merged dir it's just a straight AutoModel load.
+    from lqh.train.load_model import load_for_training
+
+    model, tokenizer, effective_base = load_for_training(
+        base_model, dtype=dtype, device_map=device_map,
+        merge_before_attach=True,
     )
-    tokenizer = AutoTokenizer.from_pretrained(base_model)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Load a reference model for DPO (frozen copy). Also on GPU; trl's
-    # DPOTrainer expects model and ref_model to be co-located.
-    ref_model = AutoModelForCausalLM.from_pretrained(
-        base_model,
-        dtype=dtype,
-        device_map=device_map,
+    # Load a reference model for DPO (frozen copy). Must be the SAME
+    # effective starting point as the policy — older code loaded the
+    # ref from base_model directly, which silently produced the wrong
+    # reference whenever base_model was an adapter dir. Going through
+    # load_for_training again produces a deterministic second copy of
+    # the same merged weights.
+    ref_model, _, _ = load_for_training(
+        base_model, dtype=dtype, device_map=device_map,
+        merge_before_attach=True,
     )
 
     # LoRA config

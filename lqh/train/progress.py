@@ -2,11 +2,24 @@
 
 All functions here operate on the filesystem only — no sockets, no pipes.
 The subprocess writes; the main process reads.
+
+Cloud sandboxes are a special case: the host can't tail a file inside
+the sandbox's volume in real time. So when ``LQH_JOB_ID`` is set in the
+process env (which the Modal runner injects via
+``SandboxCreateParams.Env``), every progress and status write is ALSO
+echoed to stdout as a single line prefixed with ``LQH_EVENT_JSON:``.
+The Modal runner's stdout parser (``cloud.parseSentinel``) pulls these
+out, converts them to SSE events, and persists them to
+``cloud_job_events`` so the live stream reaches the lqh CLI. Local and
+SSH-direct runs don't set ``LQH_JOB_ID``, so the sentinel path is a
+no-op there — file behavior is unchanged.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,7 +40,8 @@ def write_progress(
     epoch: float | None = None,
     extra: dict[str, Any] | None = None,
 ) -> None:
-    """Append a progress line to ``progress.jsonl``."""
+    """Append a progress line to ``progress.jsonl`` (and mirror to stdout
+    as an LQH_EVENT_JSON sentinel when running in a cloud sandbox)."""
     entry: dict[str, Any] = {
         "step": step,
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -41,6 +55,10 @@ def write_progress(
     if extra:
         entry.update(extra)
 
+    # Emit sentinel first so the cloud SSE path is robust even if
+    # the local file write later fails (disk full, permissions, etc).
+    # Local + SSH runs treat this as a no-op.
+    _emit_sentinel("progress", entry)
     _append_jsonl(run_dir / "progress.jsonl", entry)
 
 
@@ -61,6 +79,7 @@ def write_status(
     if extra:
         entry.update(extra)
 
+    _emit_sentinel("status", entry)
     _append_jsonl(run_dir / "progress.jsonl", entry)
 
 
@@ -159,6 +178,67 @@ def read_latest_progress(run_dir: Path) -> dict[str, Any] | None:
 
 
 def _append_jsonl(path: Path, entry: dict[str, Any]) -> None:
+    """Append one JSON line. Uses ``_json_default`` to coerce non-JSON
+    types (numpy/torch scalars, custom objects in trainer hooks) so
+    a stray value in ``extra`` never crashes a training run."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a") as f:
-        f.write(json.dumps(entry) + "\n")
+        f.write(json.dumps(entry, default=_json_default) + "\n")
+
+
+# The env var the Modal runner injects to mark "you are inside a
+# cloud sandbox". Other backends (local, SSH-direct) leave it unset.
+_CLOUD_ENV_MARKER = "LQH_JOB_ID"
+
+# stdout sentinel prefix recognized by backend/internal/cloud/modal_runner.go
+# (parseSentinel). Any line starting with this prefix is parsed as a
+# structured event; everything else is treated as a log line.
+_SENTINEL_PREFIX = "LQH_EVENT_JSON:"
+
+
+def _emit_sentinel(kind: str, payload: dict[str, Any]) -> None:
+    """If running in a cloud sandbox, echo one structured event to
+    stdout for the Modal runner to pick up.
+
+    Silent in every other context (local training, SSH-direct, tests).
+    Designed to be a strict superset of the file-based protocol — the
+    file is always written; the sentinel is the additional cloud-path
+    signal.
+
+    Failures are swallowed: a broken stdout (closed during shutdown,
+    encoding error on a quirky payload) must NEVER take down a
+    training run. The host-side parser tolerates malformed sentinels
+    by logging them and moving on.
+    """
+    if not os.environ.get(_CLOUD_ENV_MARKER):
+        return
+    try:
+        line = _SENTINEL_PREFIX + " " + json.dumps(
+            {"kind": kind, "payload": payload},
+            default=_json_default,
+        )
+        # Use print rather than sys.stdout.write so we get auto-flush
+        # behavior on line buffering. flush=True forces it even on
+        # block-buffered stdout (which is what Modal's stdout pipe
+        # typically is).
+        print(line, flush=True)
+    except Exception:
+        # Don't let telemetry break the run.
+        return
+
+
+def _json_default(obj: Any) -> Any:
+    """Fallback for objects json.dumps can't serialize natively.
+
+    Mostly catches numpy / torch scalars that creep into the
+    `extra` dict in DPO/SFT trainer hooks. Returns str(obj) as a
+    last resort so the sentinel still parses on the host side.
+    """
+    # The most common offenders have .item() (numpy/torch 0-d arrays).
+    item = getattr(obj, "item", None)
+    if callable(item):
+        try:
+            return item()
+        except Exception:
+            pass
+    return str(obj)

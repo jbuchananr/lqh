@@ -39,9 +39,9 @@ def main() -> None:
 
 def _run_inference(run_dir: Path, config: dict) -> None:
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
 
     from lqh.train.data_utils import load_chatml_dataset_with_tools
+    from lqh.train.load_model import load_for_inference
     from lqh.train.progress import write_eval_request, write_progress, write_status
     from lqh.train.tool_format import get_tool_formatter
 
@@ -49,12 +49,11 @@ def _run_inference(run_dir: Path, config: dict) -> None:
     dataset_path = config["dataset"]
 
     print(f"Loading model: {base_model}")
-    model = AutoModelForCausalLM.from_pretrained(
-        base_model,
-        dtype=torch.bfloat16,
-        device_map="auto",
+    # load_for_inference transparently handles hub ids, merged dirs,
+    # and adapter dirs (the latter via base+PeftModel+merge_and_unload).
+    model, tokenizer = load_for_inference(
+        base_model, dtype=torch.bfloat16, device_map="auto",
     )
-    tokenizer = AutoTokenizer.from_pretrained(base_model)
 
     print(f"Loading dataset: {dataset_path}")
     conversations, tools_per_sample = load_chatml_dataset_with_tools(dataset_path)

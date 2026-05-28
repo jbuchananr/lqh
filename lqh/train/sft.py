@@ -342,12 +342,21 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
     except Exception as exc:
         print(f"  WARNING: failed to dump eval_history.json: {exc}")
 
-    # Save final model
-    final_model_dir = run_dir / "model"
+    # Save final model. For LoRA runs the default is now to save the
+    # adapter alone (tens of MB) rather than merging into the base
+    # (multi-GB) — set ``lora.merge=True`` to opt into the merged
+    # artifact. The adapter-only layout writes to ``run_dir/model-lora``
+    # so the artifact in R2 (``model-lora.tar.gz``) is visually
+    # distinct from a merged checkpoint (``model.tar.gz``). Downstream
+    # consumers go through :func:`lqh.train.load_model.load_for_inference`
+    # which transparently handles both layouts.
+    merge_lora = lora_cfg.get("merge", False)
+    saving_adapter = peft_config is not None and not merge_lora
+    final_dir_name = "model-lora" if saving_adapter else "model"
+    final_model_dir = run_dir / final_dir_name
     final_model_dir.mkdir(parents=True, exist_ok=True)
 
-    if peft_config is not None:
-        # Merge LoRA adapters into base model
+    if peft_config is not None and merge_lora:
         merged_model = trainer.model.merge_and_unload()
         merged_model.save_pretrained(str(final_model_dir))
     else:
@@ -362,14 +371,15 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
         final_checkpoint = run_dir / "checkpoints" / "final"
         final_checkpoint.mkdir(parents=True, exist_ok=True)
 
-        # Reload for clean inference
+        # Free the trainer's GPU memory before loading a fresh copy for
+        # inference. The loader auto-detects adapter vs merged.
         del trainer
         torch.cuda.empty_cache()
 
-        eval_model = AutoModelForCausalLM.from_pretrained(
-            str(final_model_dir),
-            dtype=dtype,
-            device_map="auto",
+        from lqh.train.load_model import load_for_inference
+
+        eval_model, _ = load_for_inference(
+            str(final_model_dir), dtype=dtype, device_map="auto",
         )
         _run_checkpoint_eval(
             model=eval_model,
