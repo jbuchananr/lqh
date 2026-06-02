@@ -335,7 +335,7 @@ async def _golden_from_api(
     """Generate golden responses by calling the API with a strong model."""
     import asyncio
 
-    semaphore = asyncio.Semaphore(5)
+    semaphore = asyncio.Semaphore(20)
     result: dict[int, str] = {}
 
     async def _generate_one(idx: int) -> None:
