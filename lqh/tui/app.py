@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from prompt_toolkit import Application
 from prompt_toolkit.application import run_in_terminal
@@ -59,6 +60,8 @@ OTHER_OPTION = "Other (please specify)"
 # Interval between background-job completion scans, in seconds.
 # Trades freshness against SSH/filesystem load when remote runs are active.
 JOB_POLL_INTERVAL_SEC = 60.0
+RECONNECT_BACKOFF_SEC = (3.0, 20.0, 60.0)
+SLEEP_GAP_FACTOR = 2.0
 
 
 class LqhApp:
@@ -112,6 +115,9 @@ class LqhApp:
         self._input_buffer: Buffer | None = None
         self._managed_ansi = ""
         self._shutdown_requested = False
+        self._pending_reconnect: Callable[[], Awaitable[None]] | None = None
+        self._pending_reconnect_error: str | None = None
+        self._reconnect_backoffs = RECONNECT_BACKOFF_SEC
 
     def _create_layout(self) -> Layout:
         """Create a small bottom-docked layout."""
@@ -601,6 +607,10 @@ class LqhApp:
             await self._emit(render_system_message("\n".join(lines)))
             return True
 
+        if command == "/reconnect":
+            await self._do_reconnect()
+            return True
+
         if command == "/login":
             await self._do_login()
             return True
@@ -647,9 +657,12 @@ class LqhApp:
             if self._agent:
                 self._lock_input()
                 try:
-                    await self._agent.process_user_input(
-                        f"[System: The {skill_name} skill is now active. "
-                        f"Begin the workflow described in the skill instructions.]"
+                    await self._run_agent_with_reconnect(
+                        lambda: self._agent.process_user_input(
+                            f"[System: The {skill_name} skill is now active. "
+                            f"Begin the workflow described in the skill instructions.]"
+                        ),
+                        lambda: self._agent.continue_after_interruption(),
                     )
                 except Exception as e:
                     await self._emit(render_error(f"{type(e).__name__}: {e}"))
@@ -671,12 +684,133 @@ class LqhApp:
 
         try:
             if self._agent:
-                await self._agent.process_user_input(text)
+                await self._run_agent_with_reconnect(
+                    lambda: self._agent.process_user_input(text),
+                    lambda: self._agent.continue_after_interruption(),
+                )
         except Exception as e:
             await self._emit(render_error(f"{type(e).__name__}: {e}"))
         finally:
             self._unlock_input()
             self._save_session()
+
+    async def _run_agent_with_reconnect(
+        self,
+        start: Callable[[], Awaitable[None]],
+        retry: Callable[[], Awaitable[None]],
+    ) -> bool:
+        """Run an agent action with bounded reconnect retries.
+
+        ``start`` may append a new user/system message to the session. After a
+        transient failure, ``retry`` must resume the same turn without adding
+        another message.
+        """
+        action = start
+        last_error: Exception | None = None
+
+        for attempt in range(len(self._reconnect_backoffs) + 1):
+            if attempt > 0:
+                delay = self._reconnect_backoffs[attempt - 1]
+                await self._emit(render_system_message(
+                    f"Connection interrupted. Retrying in {delay:.0f}s..."
+                ))
+                await asyncio.sleep(delay)
+
+            try:
+                await action()
+            except Exception as e:
+                if not self._is_reconnectable_error(e):
+                    raise
+                last_error = e
+                action = retry
+                continue
+
+            self._pending_reconnect = None
+            self._pending_reconnect_error = None
+            return True
+
+        self._pending_reconnect = retry
+        self._pending_reconnect_error = (
+            f"{type(last_error).__name__}: {last_error}" if last_error else "Unknown error"
+        )
+        await self._emit(render_error(
+            "Connection interrupted and automatic reconnect attempts failed. "
+            "Run /reconnect to try again.\n"
+            f"{self._pending_reconnect_error}"
+        ))
+        return False
+
+    async def _do_reconnect(self) -> None:
+        """Retry the last interrupted agent operation, if any."""
+        if self._pending_reconnect is None:
+            await self._emit(render_system_message("No reconnect is pending."))
+            return
+
+        action = self._pending_reconnect
+        previous_error = self._pending_reconnect_error
+        self._pending_reconnect = None
+        self._pending_reconnect_error = None
+
+        if previous_error:
+            await self._emit(render_system_message(
+                f"Retrying interrupted operation after: {previous_error}"
+            ))
+        else:
+            await self._emit(render_system_message("Retrying interrupted operation."))
+
+        was_processing = self._processing
+        if not was_processing:
+            self._lock_input()
+        try:
+            if self._agent:
+                await self._run_agent_with_reconnect(action, action)
+        finally:
+            if not was_processing:
+                self._unlock_input()
+            self._save_session()
+
+    @staticmethod
+    def _is_reconnectable_error(exc: Exception) -> bool:
+        """Return True for transient network/API failures."""
+        if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+            return True
+
+        try:
+            import httpx
+            if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError)):
+                return True
+        except Exception:
+            pass
+
+        try:
+            from openai import (
+                APIConnectionError,
+                APIStatusError,
+                APITimeoutError,
+                RateLimitError,
+            )
+            if isinstance(exc, (APIConnectionError, APITimeoutError, RateLimitError)):
+                return True
+            if isinstance(exc, APIStatusError):
+                return exc.status_code in {408, 409, 425, 429, 500, 502, 503, 504}
+        except Exception:
+            pass
+
+        if isinstance(exc, OSError):
+            import errno
+            transient_errno = {
+                errno.ECONNABORTED,
+                errno.ECONNRESET,
+                errno.EHOSTDOWN,
+                errno.EHOSTUNREACH,
+                errno.ENETDOWN,
+                errno.ENETRESET,
+                errno.ENETUNREACH,
+                errno.ETIMEDOUT,
+            }
+            return getattr(exc, "errno", None) in transient_errno
+
+        return False
 
     async def _do_login(self) -> None:
         """Handle the /login command."""
@@ -1042,7 +1176,14 @@ class LqhApp:
         )
 
         try:
-            await self._agent.process_user_input(kickoff)
+            ok = await self._run_agent_with_reconnect(
+                lambda: self._agent.process_user_input(kickoff),
+                lambda: self._agent.continue_after_interruption(),
+            )
+            if not ok:
+                self._auto_done = True
+                self._invalidate()
+                return
         except Exception as e:
             await self._emit(render_error(
                 f"Auto mode crashed: {type(e).__name__}: {e}"
@@ -1098,12 +1239,20 @@ class LqhApp:
 
         manager = SubprocessManager()
         terminal_states = {"completed", "failed"}
+        last_wall_time = time.time()
 
         while True:
             try:
                 await asyncio.sleep(JOB_POLL_INTERVAL_SEC)
             except asyncio.CancelledError:
                 return
+
+            now = time.time()
+            if now - last_wall_time > JOB_POLL_INTERVAL_SEC * SLEEP_GAP_FACTOR:
+                await self._emit(render_system_message(
+                    "Resuming background job monitoring after a connection/sleep gap."
+                ))
+            last_wall_time = now
 
             try:
                 snapshots = await self._scan_jobs(manager)
@@ -1178,9 +1327,7 @@ class LqhApp:
             if remote_meta.exists():
                 try:
                     meta = json.loads(remote_meta.read_text())
-                    state, error = await self._poll_remote(
-                        meta["remote_name"], str(meta["job_id"]),
-                    )
+                    state, error = await self._poll_remote(entry, meta)
                     results.append((entry.name, state, error, meta["remote_name"]))
                 except Exception:
                     results.append((entry.name, "unknown", None, None))
@@ -1191,19 +1338,46 @@ class LqhApp:
 
         return results
 
-    async def _poll_remote(
-        self, remote_name: str, job_id: str,
-    ) -> tuple[str, str | None]:
-        """SSH-poll a remote job. Returns (state, error)."""
-        from lqh.remote.config import get_remote
-        from lqh.remote.ssh_direct import SSHDirectBackend
-
-        remote_config = get_remote(self.project_dir, remote_name)
-        if remote_config is None or remote_config.type != "ssh_direct":
+    async def _poll_remote(self, run_dir: Path, meta: dict[str, Any]) -> tuple[str, str | None]:
+        """Sync and poll a remote/cloud job. Returns (state, error)."""
+        backend = self._make_remote_backend(meta)
+        if backend is None:
             return ("unknown", None)
-        backend = SSHDirectBackend(remote_config, self.project_dir)
-        status = await backend.poll_status(job_id)
+        remote_run_dir = meta.get("remote_run_dir")
+        if remote_run_dir:
+            await backend.sync_progress(str(remote_run_dir), str(run_dir))
+        status = await backend.poll_status(str(meta["job_id"]))
         return (status.state, status.error)
+
+    def _make_remote_backend(self, meta: dict[str, Any]) -> Any | None:
+        """Build the backend described by remote_job.json."""
+        remote_name = str(meta.get("remote_name", ""))
+        backend_name = str(meta.get("backend", ""))
+
+        try:
+            from lqh.remote.compute import is_cloud, ssh_remote_name
+            if backend_name == "cloud" or is_cloud(remote_name):
+                from lqh.remote.backend import RemoteConfig
+                from lqh.remote.cloud import CloudBackend
+
+                cfg = RemoteConfig(
+                    name="cloud",
+                    type="cloud",
+                    hostname="api.lqh.ai",
+                    remote_root="cloud:lqh",
+                )
+                return CloudBackend(cfg, self.project_dir)
+
+            from lqh.remote.config import get_remote
+            from lqh.remote.ssh_direct import SSHDirectBackend
+
+            ssh_name = ssh_remote_name(remote_name) or remote_name
+            remote_config = get_remote(self.project_dir, ssh_name)
+            if remote_config is None or remote_config.type != "ssh_direct":
+                return None
+            return SSHDirectBackend(remote_config, self.project_dir)
+        except Exception:
+            return None
 
     async def _spawn_run_watcher(self, run_name: str, remote: str | None) -> None:
         """Start a RunWatcher (or RemoteRunWatcher) for an active run.
@@ -1230,20 +1404,16 @@ class LqhApp:
         api_base_url = load_config().api_base_url
 
         if remote:
-            from lqh.remote.config import get_remote
-            from lqh.remote.ssh_direct import SSHDirectBackend
             from lqh.remote.watcher import RemoteRunWatcher
-
-            remote_config = get_remote(self.project_dir, remote)
-            if remote_config is None or remote_config.type != "ssh_direct":
-                return
 
             meta_file = run_dir / "remote_job.json"
             if not meta_file.exists():
                 return
             meta = json.loads(meta_file.read_text())
+            backend = self._make_remote_backend(meta)
+            if backend is None:
+                return
 
-            backend = SSHDirectBackend(remote_config, self.project_dir)
             watcher = RemoteRunWatcher(
                 run_dir=run_dir,
                 config=config,
@@ -1272,10 +1442,21 @@ class LqhApp:
         self, run_name: str, state: str, error: str | None, remote: str | None,
     ) -> str:
         location = f" on remote '{remote}'" if remote else ""
+        status_call = f"training_status(run_name='{run_name}')"
+        if remote:
+            status_call = f"training_status(run_name='{run_name}', remote='{remote}')"
         if state == "completed":
-            return f"[System: training run {run_name} completed successfully{location}.]"
+            return (
+                f"[System: training run {run_name} completed successfully{location}. "
+                f"Call {status_call} now to read final details, then continue with "
+                "the natural next step.]"
+            )
         err_part = f": {error}" if error else "."
-        return f"[System: training run {run_name} failed{location}{err_part}]"
+        return (
+            f"[System: training run {run_name} failed{location}{err_part} "
+            f"Call {status_call} now to read final details, then explain the failure "
+            "and the natural recovery step.]"
+        )
 
     def _record_completion_event(
         self, run_name: str, state: str, error: str | None, remote: str | None,

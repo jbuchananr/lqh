@@ -11,7 +11,9 @@ Two layers of test:
 from __future__ import annotations
 
 import asyncio
+import io
 import json
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -190,6 +192,73 @@ def test_first_run_routes_to_cloud_silently(tmp_path, isolated_home, monkeypatch
     assert "cloud" in res.content
     # No user prompt should have been emitted.
     assert not res.requires_user_input
+
+
+def test_cloud_training_config_uses_project_relative_dataset_paths(
+    tmp_path, isolated_home, monkeypatch,
+):
+    """Cloud submit configs must not contain laptop-local absolute paths."""
+    import lqh.tools.handlers as handlers
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    ds = _make_dataset(project)
+
+    from lqh.tools.permissions import grant_permission
+    grant_permission(project, project_wide=True)
+
+    recorded: dict = {}
+
+    async def fake_remote(project_dir, run_dir, config, run_name, remote_name, api_key, **kw):
+        from lqh.tools.handlers import ToolResult
+
+        recorded["config"] = config
+        recorded["remote_name"] = remote_name
+        return ToolResult(content="stub: cloud")
+
+    monkeypatch.setattr(handlers, "_execute_start_training_remote", fake_remote)
+
+    asyncio.run(handlers.handle_start_training(
+        project,
+        type="sft",
+        base_model="LiquidAI/LFM2-1.2B",
+        dataset=ds,
+        eval_dataset=ds,
+        scorer=None,
+        remote="cloud",
+    ))
+
+    assert recorded["remote_name"] == "cloud"
+    base_config = recorded["config"]["base_config"]
+    assert base_config["dataset"] == "datasets/ds/data.parquet"
+    assert base_config["eval_dataset"] == "datasets/ds/data.parquet"
+    assert not Path(base_config["dataset"]).is_absolute()
+
+
+def test_cloud_bundle_contains_relative_config_and_dataset(tmp_path):
+    """The tarball should match the relative paths the cloud trainer reads."""
+    from lqh.remote.bundle import build_bundle
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    _make_dataset(project)
+    config = {
+        "type": "sweep",
+        "base_config": {
+            "type": "sft",
+            "base_model": "LiquidAI/LFM2-1.2B",
+            "dataset": "datasets/ds/data.parquet",
+            "manifest": ["dataset"],
+        },
+    }
+
+    bundle = build_bundle(config, project)
+    with tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz") as tar:
+        names = set(tar.getnames())
+        cfg = json.loads(tar.extractfile("config.json").read().decode("utf-8"))
+
+    assert cfg["base_config"]["dataset"] == "datasets/ds/data.parquet"
+    assert "datasets/ds/data.parquet" in names
 
 
 def test_picker_skipped_when_global_default_set(tmp_path, isolated_home, monkeypatch):

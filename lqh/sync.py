@@ -86,6 +86,7 @@ def resolve_manifest(
             manifest_keys = keys
             break
     paths: list[Path] = []
+    project_resolved = project_dir.resolve()
     for key in manifest_keys:
         value = None
         for scope in scopes:
@@ -95,7 +96,10 @@ def resolve_manifest(
                 break
         if value is None:
             continue
-        candidate = project_dir / value
+        if not isinstance(value, str):
+            continue
+        value_path = Path(value)
+        candidate = value_path if value_path.is_absolute() else project_resolved / value_path
         if candidate.exists():
             paths.append(candidate.resolve())
     return paths

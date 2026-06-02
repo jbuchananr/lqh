@@ -398,6 +398,15 @@ class Agent:
         self.session.add_message({"role": "user", "content": user_input})
         await self._run_inner_loop(is_first_turn=True)
 
+    async def continue_after_interruption(self) -> None:
+        """Resume the current agent turn without appending another message.
+
+        Used by the TUI after a transient connection failure. The failed turn's
+        user/system notification is already in ``session.messages``; retrying
+        through ``process_user_input`` would duplicate it.
+        """
+        await self._run_inner_loop(is_first_turn=True)
+
     async def _run_inner_loop(self, is_first_turn: bool = False) -> None:
         """Inner loop: call agent, execute tools, repeat until no tools."""
         has_tools_or_first = is_first_turn

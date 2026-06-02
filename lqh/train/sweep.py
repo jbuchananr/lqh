@@ -608,7 +608,7 @@ def sweep_loop(run_dir: Path, sweep_config: dict[str, Any]) -> None:
         )
         print(msg, flush=True)
         write_status(run_dir, "failed", error=msg)
-        return
+        raise SystemExit(1)
 
     print(
         f"\nsweep complete. winner={winner['config_id']} "
