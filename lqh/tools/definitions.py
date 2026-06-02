@@ -941,13 +941,17 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         _tool(
             name="start_local_eval",
             description=(
-                "Run local model inference as a subprocess and score the results "
-                "via the API judge. Use this to evaluate a locally-stored model "
-                "(e.g. a training checkpoint) on an eval dataset without using "
-                "the API for inference. Requires the 'train' optional dependencies. "
-                "Output lives at runs/<run_name>/ — predictions.parquet plus "
-                "eval_result.json once scoring finishes (NOT under evals/runs/, "
-                "which is for run_scoring's API-mode evals)."
+                "Run model inference as a subprocess and score the results "
+                "via the API judge. Best for evaluating a checkpoint that "
+                "lives on a local filesystem you control — either the "
+                "current machine (when invoked with remote='local') or a "
+                "configured SSH remote (remote='ssh:<name>'). For models "
+                "trained on LQH Cloud the checkpoint lives in R2 and is "
+                "not yet directly evaluable here — push the model to "
+                "HuggingFace via hf_push and use eval_hf_model instead. "
+                "Output lives at runs/<run_name>/ — predictions.parquet "
+                "plus eval_result.json once scoring finishes (NOT under "
+                "evals/runs/, which is for run_scoring's API-mode evals)."
             ),
             parameters={
                 "type": "object",
@@ -983,8 +987,17 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
                     "remote": {
                         "type": "string",
                         "description": (
-                            "Name of a configured remote to run inference on. "
-                            "If omitted, runs locally."
+                            "Where to run inference. Pass "
+                            "'ssh:<remote_name>' to use a configured SSH "
+                            "remote (see remote_list), or 'local' to "
+                            "force the in-process local-GPU path. When "
+                            "omitted, the tool falls back to the user's "
+                            "configured default — but **cloud is NOT "
+                            "supported here yet** (use eval_hf_model "
+                            "for cloud evaluation), so an omitted "
+                            "remote on a project with the default "
+                            "cloud target will return an error "
+                            "explaining the workaround."
                         ),
                     },
                     "system_prompt_path": {

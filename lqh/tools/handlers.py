@@ -1776,19 +1776,24 @@ def _next_run_name(project_dir: Path, prefix: str) -> str:
 
 def _pick_compute_or_use(
     project_dir: Path, explicit: str | None
-) -> str:
+) -> str | None:
     """Resolve the compute target with the precedence in lqh.remote.compute.
 
-    LQH Cloud is the product default: ``resolve_compute`` never
-    returns None, so this helper always returns a usable target
-    string. Callers that historically branched on a ``ToolResult``
-    return (the old first-run picker sentinel) no longer need to —
-    the agent should just call ``start_training`` and we route the
-    job without asking the user. Users who want a different default
-    flip it via ``compute_set``.
+    LQH Cloud is the product default — ``resolve_compute`` returns
+    ``"cloud"`` when nothing has been configured, so a bare
+    ``start_training`` call without ``remote=`` routes to cloud.
+    Two escape hatches:
+
+      * ``explicit="local"`` (or empty string) — force the in-process
+        local-GPU path. Returns ``None`` so callers can take their
+        local branch.
+      * ``explicit="ssh:<name>"`` — pinned override for one call.
     """
     from lqh.remote.compute import resolve_compute
 
+    if explicit in ("", "local"):
+        # Force local execution. Caller takes its own local branch.
+        return None
     return resolve_compute(project_dir, explicit=explicit)
 
 
@@ -1870,6 +1875,7 @@ async def handle_start_training(
     data_parquet = ds_path / "data.parquet"
     if not data_parquet.exists():
         return ToolResult(content=f"Error: dataset not found at {dataset}/data.parquet")
+    dataset_config_path = data_parquet.relative_to(project_dir.resolve()).as_posix()
 
     eval_parquet_path: str | None = None
     if eval_dataset:
@@ -1879,7 +1885,7 @@ async def handle_start_training(
             return ToolResult(
                 content=f"Error: eval dataset not found at {eval_dataset}/data.parquet"
             )
-        eval_parquet_path = str(eval_parquet)
+        eval_parquet_path = eval_parquet.relative_to(project_dir.resolve()).as_posix()
 
     scorer_path: str | None = None
     if scorer:
@@ -1905,7 +1911,7 @@ async def handle_start_training(
     config: dict[str, Any] = {
         "type": type,
         "base_model": base_model,
-        "dataset": str(data_parquet),
+        "dataset": dataset_config_path,
         "training": {
             "learning_rate": lr,
             "max_seq_length": 2048,
@@ -2257,14 +2263,16 @@ async def _training_status_remote(
         backend = CloudBackend(cfg, project_dir)
         display_remote = "LQH Cloud"
     else:
+        from lqh.remote.compute import ssh_remote_name
         from lqh.remote.config import get_remote
         from lqh.remote.ssh_direct import SSHDirectBackend
 
-        remote_config = get_remote(project_dir, remote_name)
+        ssh_name = ssh_remote_name(remote_name) or remote_name
+        remote_config = get_remote(project_dir, ssh_name)
         if remote_config is None:
-            return ToolResult(content=f"Error: remote '{remote_name}' not found.")
+            return ToolResult(content=f"Error: remote '{ssh_name}' not found.")
         backend = SSHDirectBackend(remote_config, project_dir)
-        display_remote = remote_name
+        display_remote = ssh_name
 
     try:
         # Sync progress first
@@ -2575,12 +2583,15 @@ async def _stop_training_remote(
     remote_name: str,
 ) -> ToolResult:
     """Stop a remote training run."""
+    from lqh.remote.compute import ssh_remote_name
     from lqh.remote.config import get_remote
     from lqh.remote.ssh_direct import SSHDirectBackend
 
-    remote_config = get_remote(project_dir, remote_name)
+    ssh_name = ssh_remote_name(remote_name) or remote_name
+    remote_config = get_remote(project_dir, ssh_name)
     if remote_config is None:
-        return ToolResult(content=f"Error: remote '{remote_name}' not found.")
+        return ToolResult(content=f"Error: remote '{ssh_name}' not found.")
+    remote_name = ssh_name
 
     run_dir = project_dir / "runs" / run_name
     meta_file = run_dir / "remote_job.json"
@@ -2663,9 +2674,35 @@ async def handle_start_local_eval(
     **kwargs: Any,
 ) -> ToolResult:
     """Start a local inference subprocess for model evaluation."""
+    from lqh.remote.compute import is_cloud
+
     on_bg_started = kwargs.get("on_background_task_started")
 
     remote = _pick_compute_or_use(project_dir, remote)
+
+    # Cloud branch. start_local_eval doesn't yet have artifact-aware
+    # cloud routing (gap #4 — eval_hf only accepts HF repos, not LQH
+    # artifact IDs). Until that lands, give the agent a precise next
+    # step rather than failing with "remote 'cloud' not found".
+    if is_cloud(remote):
+        return ToolResult(content=(
+            "❌ start_local_eval doesn't yet support cloud evaluation "
+            "of LQH-trained checkpoints (the artifact-aware cloud "
+            "eval path is not wired). To evaluate this model, choose "
+            "one:\n\n"
+            "  • **eval_hf_model** — if the checkpoint is on "
+            "HuggingFace (or push it via hf_push first), call "
+            f"`eval_hf_model(repo='<org>/<name>', "
+            f"eval_dataset='{dataset}', scorer='{scorer}')`. This "
+            "runs entirely on cloud GPUs.\n\n"
+            "  • **SSH remote** — call start_local_eval again with "
+            "an explicit `remote='<ssh-remote-name>'` (see "
+            "`remote_list`). The SSH backend can load LoRA adapters "
+            "from local paths directly.\n\n"
+            "  • **Local eval** — call start_local_eval again with "
+            "`remote=''` to force the local path (requires a local "
+            "GPU + the `train` extras installed)."
+        ))
 
     if remote:
         return await _start_local_eval_remote(
@@ -2908,12 +2945,17 @@ async def _start_local_eval_remote(
     on_bg_started: Callable[[str, str, str, str | None], None] | None = None,
 ) -> ToolResult:
     """Start inference on a remote backend."""
+    from lqh.remote.compute import ssh_remote_name
     from lqh.remote.config import get_remote
     from lqh.remote.ssh_direct import SSHDirectBackend
 
-    remote_config = get_remote(project_dir, remote_name)
+    # Normalise the remote arg: ``ssh:toka`` → ``toka``. Without this
+    # the lookup keys on the literal "ssh:toka" string and fails.
+    ssh_name = ssh_remote_name(remote_name) or remote_name
+    remote_config = get_remote(project_dir, ssh_name)
     if remote_config is None:
-        return ToolResult(content=f"Error: remote '{remote_name}' not found.")
+        return ToolResult(content=f"Error: remote '{ssh_name}' not found.")
+    remote_name = ssh_name
 
     if remote_config.type == "ssh_slurm":
         return ToolResult(content="Error: SSH+Slurm backend is not yet implemented.")

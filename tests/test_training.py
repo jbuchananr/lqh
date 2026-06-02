@@ -335,10 +335,71 @@ class TestSyncBackend:
         assert len(paths) == 1
         assert paths[0].name == "data.parquet"
 
+    def test_resolve_manifest_accepts_absolute_paths_inside_project(
+        self, tmp_path: Path,
+    ) -> None:
+        from lqh.sync import resolve_manifest
+
+        data_path = tmp_path / "datasets" / "data.parquet"
+        data_path.parent.mkdir()
+        data_path.write_text("dummy")
+
+        paths = resolve_manifest(
+            {
+                "dataset": str(data_path),
+                "manifest": ["dataset"],
+            },
+            tmp_path,
+        )
+
+        assert paths == [data_path.resolve()]
+
     def test_resolve_manifest_empty(self, tmp_path: Path) -> None:
         from lqh.sync import resolve_manifest
 
         assert resolve_manifest({}, tmp_path) == []
+
+
+# ---------------------------------------------------------------------------
+# Sweep orchestration
+# ---------------------------------------------------------------------------
+
+
+class TestSweepOrchestration:
+    """Sweep-level behavior that does not require running model training."""
+
+    def test_all_failed_sweep_exits_nonzero(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from lqh.train import sweep
+
+        run_dir = tmp_path / "runs" / "failed_sweep"
+        run_dir.mkdir(parents=True)
+
+        monkeypatch.setattr(sweep, "_run_child", lambda sub_run_dir, sub_config: 1)
+
+        cfg = {
+            "type": "sweep",
+            "base_config": {
+                "type": "sft",
+                "base_model": "test-model",
+                "dataset": "datasets/train/data.parquet",
+            },
+            "grid_override": [
+                {"id": "always_fails", "overrides": {"training": {"num_epochs": 1}}},
+            ],
+        }
+
+        with pytest.raises(SystemExit) as exc:
+            sweep.sweep_loop(run_dir, cfg)
+
+        assert exc.value.code == 1
+        rows = [
+            json.loads(line)
+            for line in (run_dir / "progress.jsonl").read_text().splitlines()
+        ]
+        assert rows[-1]["status"] == "failed"
+        assert "all 1 sweep configs failed" in rows[-1]["error"]
 
 
 # ---------------------------------------------------------------------------
@@ -469,11 +530,15 @@ class TestTrainingToolValidation:
     ) -> None:
         from lqh.tools.handlers import handle_start_local_eval
 
+        # remote='local' forces the in-process branch so we hit the
+        # model-path validation. Without it, the default cloud target
+        # returns the "use eval_hf_model" guidance message.
         result = await handle_start_local_eval(
             training_workspace,
             model_path="runs/nonexistent/model",
             dataset="datasets/test_ds",
             scorer="evals/scorers/test.md",
+            remote="local",
         )
         assert "not found" in result.content
 
