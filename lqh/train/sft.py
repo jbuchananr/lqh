@@ -29,6 +29,7 @@ from lqh.train.data_utils import (
     split_train_eval,
 )
 from lqh.train.progress import write_eval_request, write_progress, write_status
+from lqh.train.resume import train_with_checkpoint_fallback
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +367,11 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
     trainer = SFTTrainer(**trainer_kwargs)
 
     print("Starting training...")
-    trainer.train()
+    train_with_checkpoint_fallback(
+        trainer,
+        run_dir / "checkpoints",
+        label="sft",
+    )
 
     # Dump the full log history (one entry per logging step, including
     # eval rows) for downstream correlation analysis. Filter to

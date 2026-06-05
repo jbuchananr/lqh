@@ -26,7 +26,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 from unittest.mock import MagicMock, patch
 
 import pyarrow as pa
@@ -400,6 +400,155 @@ class TestSweepOrchestration:
         ]
         assert rows[-1]["status"] == "failed"
         assert "all 1 sweep configs failed" in rows[-1]["error"]
+
+    def test_continuation_skips_completed_sweep_configs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from lqh.train import sweep
+
+        run_dir = tmp_path / "runs" / "continued_sweep"
+        run_dir.mkdir(parents=True)
+        (run_dir / "runs.jsonl").write_text(
+            json.dumps({
+                "config_id": "done",
+                "overrides": {"training": {"learning_rate": 1e-5}},
+                "rc": 0,
+                "primary": 1.5,
+                "collapsed": False,
+                "elapsed_s": 12.0,
+                "sub_dir": "sweep_done",
+            }) + "\n"
+        )
+
+        ran: list[str] = []
+
+        def fake_run_child(sub_run_dir: Path, sub_config: dict[str, Any]) -> int:
+            ran.append(sub_run_dir.name)
+            sub_run_dir.mkdir(parents=True)
+            (sub_run_dir / "eval_history.json").write_text(
+                json.dumps([{"eval_loss": 1.0}]) + "\n"
+            )
+            return 0
+
+        monkeypatch.setenv("LQH_CONTINUATION", "1")
+        monkeypatch.setattr(sweep, "_run_child", fake_run_child)
+
+        cfg = {
+            "type": "sweep",
+            "base_config": {
+                "type": "sft",
+                "base_model": "test-model",
+                "dataset": "datasets/train/data.parquet",
+            },
+            "grid_override": [
+                {"id": "done", "overrides": {"training": {"learning_rate": 1e-5}}},
+                {"id": "todo", "overrides": {"training": {"learning_rate": 2e-5}}},
+            ],
+            "eval_best": False,
+        }
+
+        sweep.sweep_loop(run_dir, cfg)
+
+        assert ran == ["sweep_todo"]
+        summary = json.loads((run_dir / "sweep_summary.json").read_text())
+        assert [row["config_id"] for row in summary["rows"]] == ["done", "todo"]
+        assert summary["winner"]["config_id"] == "todo"
+
+        progress_rows = [
+            json.loads(line)
+            for line in (run_dir / "progress.jsonl").read_text().splitlines()
+        ]
+        resumed = [
+            row for row in progress_rows
+            if row.get("phase") == "sweep_config_done"
+            and row.get("config_id") == "done"
+        ]
+        assert resumed and resumed[-1].get("resumed") is True
+
+
+# ---------------------------------------------------------------------------
+# Cloud continuation resume helpers
+# ---------------------------------------------------------------------------
+
+
+class TestContinuationResume:
+    def test_checkpoint_candidates_newest_first(self, tmp_path: Path) -> None:
+        from lqh.train.resume import checkpoint_candidates
+
+        root = tmp_path / "checkpoints"
+        (root / "checkpoint-50").mkdir(parents=True)
+        (root / "checkpoint-100").mkdir()
+        (root / "step_200").mkdir()
+
+        assert [p.name for p in checkpoint_candidates(root)] == [
+            "checkpoint-100",
+            "checkpoint-50",
+        ]
+
+    def test_train_with_checkpoint_fallback_tries_older_then_scratch(
+        self, tmp_path: Path,
+    ) -> None:
+        from lqh.train.resume import train_with_checkpoint_fallback
+
+        root = tmp_path / "checkpoints"
+        (root / "checkpoint-100").mkdir(parents=True)
+        (root / "checkpoint-50").mkdir()
+
+        class FakeTrainer:
+            def __init__(self) -> None:
+                self.calls: list[str | None] = []
+
+            def train(self, resume_from_checkpoint: str | None = None) -> str:
+                self.calls.append(resume_from_checkpoint)
+                if resume_from_checkpoint is not None:
+                    raise RuntimeError("corrupt checkpoint")
+                return "fresh"
+
+        trainer = FakeTrainer()
+
+        assert train_with_checkpoint_fallback(
+            trainer,
+            root,
+            label="unit",
+            continuation=True,
+        ) == "fresh"
+        assert [Path(c).name if c else None for c in trainer.calls] == [
+            "checkpoint-100",
+            "checkpoint-50",
+            None,
+        ]
+
+    def test_train_with_checkpoint_fallback_uses_first_valid_checkpoint(
+        self, tmp_path: Path,
+    ) -> None:
+        from lqh.train.resume import train_with_checkpoint_fallback
+
+        root = tmp_path / "checkpoints"
+        (root / "checkpoint-100").mkdir(parents=True)
+        (root / "checkpoint-50").mkdir()
+
+        class FakeTrainer:
+            def __init__(self) -> None:
+                self.calls: list[str | None] = []
+
+            def train(self, resume_from_checkpoint: str | None = None) -> str:
+                self.calls.append(resume_from_checkpoint)
+                if resume_from_checkpoint and resume_from_checkpoint.endswith("checkpoint-100"):
+                    raise RuntimeError("corrupt latest")
+                return "resumed"
+
+        trainer = FakeTrainer()
+
+        assert train_with_checkpoint_fallback(
+            trainer,
+            root,
+            label="unit",
+            continuation=True,
+        ) == "resumed"
+        assert [Path(c).name if c else None for c in trainer.calls] == [
+            "checkpoint-100",
+            "checkpoint-50",
+        ]
 
 
 # ---------------------------------------------------------------------------

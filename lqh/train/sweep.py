@@ -79,6 +79,7 @@ from pathlib import Path
 from typing import Any
 
 from lqh.train.progress import write_progress, write_status
+from lqh.train.resume import is_continuation
 
 
 # ---------------------------------------------------------------------------
@@ -477,6 +478,51 @@ def _materialize_best_model(winner_dir: Path, run_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _completed_sweep_rows(runs_jsonl_path: Path) -> dict[str, dict[str, Any]]:
+    """Read successful per-config rows from a previous sweep attempt."""
+    if not runs_jsonl_path.exists():
+        return {}
+    done: dict[str, dict[str, Any]] = {}
+    try:
+        lines = runs_jsonl_path.read_text().splitlines()
+    except OSError:
+        return done
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        config_id = row.get("config_id")
+        if isinstance(config_id, str) and row.get("rc") == 0:
+            done[config_id] = row
+    return done
+
+
+def _write_sweep_summary(
+    path: Path,
+    *,
+    run_type: str,
+    grid_size: str,
+    n_configs: int,
+    proxy_key: str,
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    summary = {
+        "mode": run_type,
+        "grid_size": grid_size,
+        "n_configs": n_configs,
+        "n_completed": len(rows),
+        "proxy_key": proxy_key,
+        "collapse_threshold_delta_ref": COLLAPSE_DELTA_REF_THRESHOLD,
+        "rows": rows,
+        "winner": _pick_winner(rows, run_type),
+    }
+    path.write_text(json.dumps(summary, indent=2, default=str) + "\n")
+    return summary
+
+
 def sweep_loop(run_dir: Path, sweep_config: dict[str, Any]) -> None:
     """Sweep entry point invoked by ``python -m lqh.train.sweep <cfg>``."""
     base = sweep_config["base_config"]
@@ -511,12 +557,55 @@ def sweep_loop(run_dir: Path, sweep_config: dict[str, Any]) -> None:
     rows: list[dict[str, Any]] = []
     sweep_summary_path = run_dir / "sweep_summary.json"
     runs_jsonl_path = run_dir / "runs.jsonl"
+    completed_rows = _completed_sweep_rows(runs_jsonl_path) if is_continuation() else {}
+    if completed_rows:
+        print(
+            f"sweep: continuation detected; {len(completed_rows)} completed config(s) "
+            "will be skipped",
+            flush=True,
+        )
 
     for i, point in enumerate(grid):
         sub_run_dir = run_dir / f"sweep_{point.id}"
         sub_config = _deep_merge(base, point.overrides)
         # Child runs MUST not recurse into another sweep.
         sub_config.pop("enable_sweep", None)
+
+        if point.id in completed_rows:
+            row = dict(completed_rows[point.id])
+            rows.append(row)
+            print(
+                f"\n[{i+1}/{len(grid)}] {point.id} already completed; skipping",
+                flush=True,
+            )
+            write_progress(
+                run_dir, step=i + 1,
+                extra={
+                    "phase": "sweep_config_done",
+                    "config_id": point.id,
+                    "rc": row.get("rc"),
+                    "primary": row.get("primary"),
+                    "collapsed": row.get("collapsed", False),
+                    "config_index": i,
+                    "n_configs": len(grid),
+                    "resumed": True,
+                },
+            )
+            running_summary = _write_sweep_summary(
+                sweep_summary_path,
+                run_type=run_type,
+                grid_size=grid_size,
+                n_configs=len(grid),
+                proxy_key=proxy_key,
+                rows=rows,
+            )
+            running_winner = running_summary["winner"]
+            if (
+                running_winner is not None
+                and running_winner["config_id"] == point.id
+            ):
+                _materialize_best_model(sub_run_dir, run_dir)
+            continue
 
         write_progress(
             run_dir, step=i,
@@ -581,20 +670,15 @@ def sweep_loop(run_dir: Path, sweep_config: dict[str, Any]) -> None:
             },
         )
 
-        running_winner = _pick_winner(rows, run_type)
-        sweep_summary = {
-            "mode": run_type,
-            "grid_size": grid_size,
-            "n_configs": len(grid),
-            "n_completed": len(rows),
-            "proxy_key": proxy_key,
-            "collapse_threshold_delta_ref": COLLAPSE_DELTA_REF_THRESHOLD,
-            "rows": rows,
-            "winner": running_winner,
-        }
-        sweep_summary_path.write_text(
-            json.dumps(sweep_summary, indent=2, default=str) + "\n"
+        sweep_summary = _write_sweep_summary(
+            sweep_summary_path,
+            run_type=run_type,
+            grid_size=grid_size,
+            n_configs=len(grid),
+            proxy_key=proxy_key,
+            rows=rows,
         )
+        running_winner = sweep_summary["winner"]
 
         if (running_winner is not None
                 and running_winner["config_id"] == point.id):

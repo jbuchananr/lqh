@@ -41,6 +41,7 @@ from lqh.train.progress import (
     write_progress,
     write_status,
 )
+from lqh.train.resume import train_with_checkpoint_fallback
 
 
 class _DPOProgressCallback(TrainerCallback):
@@ -726,7 +727,11 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
             trainer_kwargs["peft_config"] = peft_config
 
         trainer = DPOTrainer(**trainer_kwargs)
-        train_result = trainer.train()
+        train_result = train_with_checkpoint_fallback(
+            trainer,
+            iter_dir / "dpo_output",
+            label=f"dpo iteration {iteration}",
+        )
 
         # Pull final eval metrics out of the log history. Scan
         # backwards for the last eval row (one with "eval_loss").
