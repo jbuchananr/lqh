@@ -46,6 +46,26 @@ def test_apply_preserves_effective_batch():
     # safe micro larger than effective → accum floors at 1
     calibrate._apply(cfg, 32, 16)
     assert cfg["gradient_accumulation_steps"] == 1
+    # non-divisible micro-batches should not undershoot the requested
+    # effective batch.
+    calibrate._apply(cfg, 48, 256)
+    assert cfg["gradient_accumulation_steps"] == 6
+
+
+def test_ensure_batch_defaults_targets_effective_batch():
+    cfg: dict = {}
+    calibrate.ensure_batch_defaults(cfg, default_micro_batch=256)
+    assert cfg["per_device_batch_size"] == 256
+    assert cfg["gradient_accumulation_steps"] == 1
+    assert cfg["effective_batch_size"] == 256
+
+
+def test_ensure_batch_defaults_honors_explicit_batch_shape():
+    cfg = {"per_device_batch_size": 8, "gradient_accumulation_steps": 4}
+    calibrate.ensure_batch_defaults(cfg, default_micro_batch=4)
+    assert cfg["per_device_batch_size"] == 8
+    assert cfg["gradient_accumulation_steps"] == 4
+    assert cfg["effective_batch_size"] == 32
 
 
 def test_get_cached_profile_noop_without_env(monkeypatch):

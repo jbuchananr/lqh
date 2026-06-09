@@ -402,6 +402,56 @@ class TestSweepOrchestration:
         assert rows[-1]["status"] == "failed"
         assert "all 1 sweep configs failed" in rows[-1]["error"]
 
+    def test_dpo_no_proxy_error_explains_low_preference_yield(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from lqh.train import sweep
+
+        run_dir = tmp_path / "runs" / "dpo_no_proxy"
+        run_dir.mkdir(parents=True)
+
+        def fake_run_child(sub_run_dir: Path, sub_config: dict[str, Any]) -> int:
+            iter_dir = sub_run_dir / "iterations" / "iter_000"
+            iter_dir.mkdir(parents=True)
+            (iter_dir / "dpo_result.json").write_text(
+                json.dumps({
+                    "iteration": 0,
+                    "num_preferences": 35,
+                    "train_pairs": 35,
+                    "eval_pairs": 0,
+                    "final_chosen_ce": {},
+                }) + "\n"
+            )
+            return 0
+
+        monkeypatch.setattr(sweep, "_run_child", fake_run_child)
+
+        cfg = {
+            "type": "sweep",
+            "base_config": {
+                "type": "on_policy_dpo",
+                "base_model": "test-model",
+                "dataset": "datasets/train/data.parquet",
+                "training": {"eval_split_ratio": 0.1},
+            },
+            "grid_override": [
+                {"id": "no_eval_pairs", "overrides": {"dpo_beta": 0.1}},
+            ],
+        }
+
+        with pytest.raises(SystemExit) as exc:
+            sweep.sweep_loop(run_dir, cfg)
+
+        assert exc.value.code == 1
+        rows = [
+            json.loads(line)
+            for line in (run_dir / "progress.jsonl").read_text().splitlines()
+        ]
+        assert rows[-1]["status"] == "failed"
+        assert "too few usable preference pairs" in rows[-1]["error"]
+        assert "already too close to the chosen/gold answers" in rows[-1]["error"]
+        assert "0 held-out preference pairs" in rows[-1]["error"]
+
     def test_continuation_skips_completed_sweep_configs(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:

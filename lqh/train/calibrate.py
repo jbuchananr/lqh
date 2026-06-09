@@ -30,7 +30,7 @@ from typing import Any
 _DEFAULT_HEADROOM = 0.85
 
 # Micro-batch candidates probed in ascending order.
-_PROBE_BATCHES = [1, 2, 4, 8, 16, 24, 32, 48, 64]
+_PROBE_BATCHES = [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256]
 
 
 def _in_cloud() -> bool:
@@ -138,15 +138,49 @@ def _post_profile(
 
 def _apply(training_cfg: dict[str, Any], micro: int, target_effective: int) -> int:
     """Set per_device_batch_size to ``micro`` and adjust grad accumulation
-    to preserve the configured effective batch size. Returns grad_accum."""
+    to preserve at least the configured effective batch size. Returns
+    grad_accum."""
     micro = max(1, micro)
-    accum = max(1, round(target_effective / micro))
+    accum = max(1, math.ceil(target_effective / micro))
     training_cfg["per_device_batch_size"] = micro
     training_cfg["gradient_accumulation_steps"] = accum
     return accum
 
 
-def _probe_micro_batch(model, tokenizer, *, seq_len: int, start: int, target_headroom: float):
+def ensure_batch_defaults(
+    training_cfg: dict[str, Any],
+    *,
+    default_micro_batch: int,
+    default_effective_batch: int = 256,
+) -> None:
+    """Fill missing batch knobs with LoRA-friendly defaults.
+
+    ``effective_batch_size`` is a local lqh config field used by the
+    auto-tuner as the target optimizer batch. HF Trainer consumes the derived
+    ``per_device_batch_size`` and ``gradient_accumulation_steps`` fields.
+    Explicit user-provided micro/accum settings are left intact.
+    """
+    if "per_device_batch_size" not in training_cfg:
+        training_cfg["per_device_batch_size"] = default_micro_batch
+
+    micro = max(1, int(training_cfg.get("per_device_batch_size", default_micro_batch)))
+    if "gradient_accumulation_steps" not in training_cfg:
+        target = int(training_cfg.get("effective_batch_size", default_effective_batch))
+        training_cfg["gradient_accumulation_steps"] = max(1, math.ceil(target / micro))
+
+    if "effective_batch_size" not in training_cfg:
+        accum = max(1, int(training_cfg.get("gradient_accumulation_steps", 1)))
+        training_cfg["effective_batch_size"] = max(1, micro * accum)
+
+
+def _probe_micro_batch(
+    model,
+    tokenizer,
+    *,
+    seq_len: int,
+    max_micro_batch: int,
+    target_headroom: float,
+):
     """Probe increasing micro-batches with a real fwd+backward and a short
     generate(), returning (safe_micro_batch, peak_mem_mb) or (None, None).
 
@@ -165,7 +199,11 @@ def _probe_micro_batch(model, tokenizer, *, seq_len: int, start: int, target_hea
 
     safe: int | None = None
     peak: int | None = None
-    candidates = [b for b in _PROBE_BATCHES if b >= max(1, start)] or [max(1, start)]
+    max_micro_batch = max(1, max_micro_batch)
+    candidates = [b for b in _PROBE_BATCHES if b <= max_micro_batch]
+    if max_micro_batch not in candidates:
+        candidates.append(max_micro_batch)
+    candidates = sorted(set(candidates))
     was_training = model.training
     for b in candidates:
         try:
@@ -214,11 +252,10 @@ def maybe_autotune_batch_size(
 ) -> None:
     """Calibrate per_device_batch_size in place when auto-tuning is on.
 
-    Enabled by ``training.auto_batch`` (default: on in cloud sandboxes,
-    off locally where there is no backend to cache against). Never raises.
+    Enabled by ``training.auto_batch`` (default: on). Never raises.
     """
     try:
-        enabled = bool(training_cfg.get("auto_batch", _in_cloud()))
+        enabled = bool(training_cfg.get("auto_batch", True))
         if not enabled:
             return
         import torch
@@ -243,7 +280,10 @@ def maybe_autotune_batch_size(
 
         cur_micro = int(training_cfg.get("per_device_batch_size", 4))
         cur_accum = int(training_cfg.get("gradient_accumulation_steps", 1))
-        target_effective = max(1, cur_micro * cur_accum)
+        target_effective = max(
+            1,
+            int(training_cfg.get("effective_batch_size", cur_micro * cur_accum)),
+        )
 
         cached = _get_cached_profile(key)
         if cached and cached.get("measured_micro_batch"):
@@ -251,17 +291,22 @@ def maybe_autotune_batch_size(
             cap = cached.get("admin_max_micro_batch")
             if cap:
                 micro = min(micro, int(cap))
-            accum = _apply(training_cfg, micro, target_effective)
-            print(
-                f"calibrate: cached micro_batch={micro} grad_accum={accum} "
-                f"(effective {target_effective}, gpu={gpu_type})",
-                flush=True,
-            )
-            return
+            if micro >= cur_micro:
+                accum = _apply(training_cfg, micro, target_effective)
+                print(
+                    f"calibrate: cached micro_batch={micro} grad_accum={accum} "
+                    f"(effective {target_effective}, gpu={gpu_type})",
+                    flush=True,
+                )
+                return
 
         headroom = float(training_cfg.get("batch_headroom", _DEFAULT_HEADROOM))
         safe, peak = _probe_micro_batch(
-            model, tokenizer, seq_len=seq_len, start=cur_micro, target_headroom=headroom
+            model,
+            tokenizer,
+            seq_len=seq_len,
+            max_micro_batch=cur_micro,
+            target_headroom=headroom,
         )
         if not safe:
             print("calibrate: probe found no safe batch; keeping configured default", flush=True)

@@ -305,9 +305,14 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
     # in place (per_device_batch_size + gradient_accumulation_steps) so
     # the sft_kwargs below pick up the calibrated values. No-op when
     # auto_batch is off, no GPU, or the backend is unreachable.
-    from lqh.train.calibrate import maybe_autotune_batch_size
+    from lqh.train.calibrate import ensure_batch_defaults, maybe_autotune_batch_size
 
     _lora_enabled = lora_cfg.get("enabled", True)
+    ensure_batch_defaults(
+        training_cfg,
+        default_micro_batch=256 if _lora_enabled else 1,
+        default_effective_batch=256 if _lora_enabled else 16,
+    )
     maybe_autotune_batch_size(
         training_cfg,
         model=model,

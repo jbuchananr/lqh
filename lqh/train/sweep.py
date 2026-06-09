@@ -649,6 +649,61 @@ def _write_sweep_summary(
     return summary
 
 
+def _dpo_no_proxy_message(run_dir: Path, rows: list[dict[str, Any]]) -> str | None:
+    """Explain the common DPO no-winner case: completed configs with no
+    held-out preference pairs, so the chosen-CE proxy was never written."""
+    if not rows:
+        return None
+
+    completed_without_proxy = [
+        r for r in rows
+        if r.get("rc") == 0 and r.get("primary") is None and not r.get("collapsed")
+    ]
+    if len(completed_without_proxy) != len(rows):
+        return None
+
+    prefs: list[int] = []
+    eval_pairs: list[int] = []
+    n_iters = 0
+    for row in completed_without_proxy:
+        sub_dir = row.get("sub_dir")
+        if not isinstance(sub_dir, str):
+            continue
+        iter_root = run_dir / sub_dir / "iterations"
+        if not iter_root.exists():
+            continue
+        for result_path in sorted(iter_root.glob("iter_*/dpo_result.json")):
+            try:
+                payload = json.loads(result_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            n_iters += 1
+            if isinstance(payload.get("num_preferences"), int):
+                prefs.append(payload["num_preferences"])
+            if isinstance(payload.get("eval_pairs"), int):
+                eval_pairs.append(payload["eval_pairs"])
+
+    if not n_iters or not eval_pairs or any(n > 0 for n in eval_pairs):
+        return None
+
+    pref_range = (
+        f"{min(prefs)}-{max(prefs)}" if prefs and min(prefs) != max(prefs)
+        else str(prefs[0]) if prefs
+        else "too few"
+    )
+    return (
+        "DPO generated too few usable preference pairs to compute the sweep "
+        "proxy. All completed configs had 0 held-out preference pairs, so "
+        "iterations/iter_000/chosen_ce_summary.json was not written and "
+        "eval_ce_chosen_mean is unavailable. This usually means the policy "
+        "rollouts are already too close to the chosen/gold answers for this "
+        f"DPO prompt count: observed only {pref_range} preference pairs per "
+        "iteration. DPO cannot be selected/applied reliably at this size; "
+        "increase the DPO prompt count substantially, use prompts with more "
+        "headroom, or skip DPO for this benchmark point."
+    )
+
+
 def sweep_loop(run_dir: Path, sweep_config: dict[str, Any]) -> None:
     """Sweep entry point invoked by ``python -m lqh.train.sweep <cfg>``."""
     base = sweep_config["base_config"]
@@ -822,7 +877,8 @@ def sweep_loop(run_dir: Path, sweep_config: dict[str, Any]) -> None:
 
     winner = _pick_winner(rows, run_type)
     if winner is None:
-        msg = (
+        dpo_msg = _dpo_no_proxy_message(run_dir, rows) if run_type != "sft" else None
+        msg = dpo_msg or (
             f"all {len(rows)} sweep configs failed or collapsed; "
             f"no model selected"
         )

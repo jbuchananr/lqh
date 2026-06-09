@@ -2233,6 +2233,16 @@ async def handle_start_training(
     # Build config
     default_lr = 2e-5 if type == "sft" else 5e-6
     lr = learning_rate if learning_rate is not None else default_lr
+    if lora:
+        default_micro_batch = 256
+        default_effective_batch = 256
+    else:
+        default_micro_batch = 1
+        default_effective_batch = 16 if type == "sft" else 2
+    default_grad_accum = max(
+        1,
+        (default_effective_batch + default_micro_batch - 1) // default_micro_batch,
+    )
 
     config: dict[str, Any] = {
         "type": type,
@@ -2241,6 +2251,10 @@ async def handle_start_training(
         "training": {
             "learning_rate": lr,
             "max_seq_length": 2048,
+            "per_device_batch_size": default_micro_batch,
+            "gradient_accumulation_steps": default_grad_accum,
+            "effective_batch_size": default_effective_batch,
+            "auto_batch": True,
         },
         "lora": {
             "enabled": lora,
