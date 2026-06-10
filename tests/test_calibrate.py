@@ -174,8 +174,9 @@ def test_autotune_probes_full_range_despite_small_config(monkeypatch):
     monkeypatch.setattr(calibrate, "_get_cached_profile", lambda key: None)
     seen = {}
 
-    def fake_probe(model, tokenizer, *, seq_len, max_micro_batch, target_headroom, gradient_checkpointing):
+    def fake_probe(model, tokenizer, *, max_micro_batch, **kwargs):
         seen["max_micro_batch"] = max_micro_batch
+        seen.update(kwargs)
         return 96, 25_000
 
     monkeypatch.setattr(calibrate, "_probe_micro_batch", fake_probe)
@@ -195,6 +196,7 @@ def test_autotune_probes_full_range_despite_small_config(monkeypatch):
         cfg, model=object(), tokenizer=object(), base_model="m", method="lora", lora_rank=32
     )
     assert seen["max_micro_batch"] == max(calibrate._PROBE_BATCHES)
+    assert seen["pair_batch"] is False
     assert cfg["per_device_batch_size"] == 96
     assert cfg["gradient_accumulation_steps"] == 1  # ceil(64/96)
     assert posted["micro_batch"] == 96
@@ -210,7 +212,7 @@ def test_autotune_probe_cap_uses_admin_ceiling(monkeypatch):
     )
     seen = {}
 
-    def fake_probe(model, tokenizer, *, seq_len, max_micro_batch, target_headroom, gradient_checkpointing):
+    def fake_probe(model, tokenizer, *, max_micro_batch, **kwargs):
         seen["max_micro_batch"] = max_micro_batch
         return 48, 10_000
 
@@ -222,3 +224,72 @@ def test_autotune_probe_cap_uses_admin_ceiling(monkeypatch):
     )
     assert seen["max_micro_batch"] == 48
     assert cfg["per_device_batch_size"] == 48
+
+
+def test_autotune_dpo_method_keys_separately_and_probes_pairs(monkeypatch):
+    """DPO must not consume an SFT-cached batch: its key is dpo-prefixed
+    and its probe is pair-shaped."""
+    _patch_torch(monkeypatch)
+    seen_key = {}
+
+    def fake_get(key):
+        seen_key.update(key)
+        return None
+
+    monkeypatch.setattr(calibrate, "_get_cached_profile", fake_get)
+    seen = {}
+
+    def fake_probe(model, tokenizer, **kwargs):
+        seen.update(kwargs)
+        return 16, 30_000
+
+    monkeypatch.setattr(calibrate, "_probe_micro_batch", fake_probe)
+    posted_key = {}
+
+    def fake_post(key, **kwargs):
+        posted_key.update(key)
+        return True
+
+    monkeypatch.setattr(calibrate, "_post_profile", fake_post)
+    cfg = {"per_device_batch_size": 256, "effective_batch_size": 256}
+    calibrate.maybe_autotune_batch_size(
+        cfg, model=object(), tokenizer=object(), base_model="m", method="dpo_lora", lora_rank=32
+    )
+    assert seen_key["training_method"] == "dpo_lora"
+    assert posted_key["training_method"] == "dpo_lora"
+    assert seen["pair_batch"] is True
+    assert cfg["per_device_batch_size"] == 16
+
+
+def test_autotune_no_cache_io_when_checkpointing_disabled(monkeypatch):
+    """The shared cache is measured with gradient checkpointing ON; a run
+    with it disabled must not consume cached values nor write back its
+    own (much smaller) probe result."""
+    _patch_torch(monkeypatch)
+    monkeypatch.setattr(
+        calibrate,
+        "_get_cached_profile",
+        lambda key: {"measured_micro_batch": 256, "admin_max_micro_batch": None},
+    )
+
+    def fake_probe(model, tokenizer, **kwargs):
+        assert kwargs["gradient_checkpointing"] is False
+        return 8, 40_000
+
+    monkeypatch.setattr(calibrate, "_probe_micro_batch", fake_probe)
+
+    def fail_post(key, **kwargs):
+        raise AssertionError("must not write back when checkpointing is off")
+
+    monkeypatch.setattr(calibrate, "_post_profile", fail_post)
+    cfg = {
+        "per_device_batch_size": 4,
+        "effective_batch_size": 64,
+        "gradient_checkpointing": False,
+    }
+    calibrate.maybe_autotune_batch_size(
+        cfg, model=object(), tokenizer=object(), base_model="m", method="lora", lora_rank=32
+    )
+    # The cached 256 (measured WITH checkpointing) must not apply; the
+    # local probe result does.
+    assert cfg["per_device_batch_size"] == 8

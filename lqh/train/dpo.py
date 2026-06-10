@@ -628,10 +628,12 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
         # Probe on the model in its TRAINING configuration: wrap with the
         # LoRA adapter first (frozen base + tiny trainable adapter) and
         # unload right after, so DPOTrainer's peft_config wiring below is
-        # untouched. Note the probe still under-counts the resident
-        # frozen ref model (~2 bytes/param, ref stays loaded during
-        # training); the 15% headroom covers that at the ≤1.2B scale we
-        # run DPO at.
+        # untouched. The dpo_* method makes the probe pair-shaped (2x
+        # sequences + a no-grad ref-approximation forward) and keys the
+        # profile separately from SFT — an SFT-discovered batch must
+        # never be reused here (pairs + resident ref model would OOM).
+        # The ref model is already resident at this point, so its weights
+        # are part of the measured footprint.
         from lqh.train.calibrate import ensure_batch_defaults, maybe_autotune_batch_size
 
         _dpo_lora_enabled = lora_cfg.get("enabled", True)
@@ -650,7 +652,7 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
             model=_probe_model,
             tokenizer=tokenizer,
             base_model=base_model,
-            method="lora" if _dpo_lora_enabled else "full",
+            method="dpo_lora" if _dpo_lora_enabled else "dpo_full",
             lora_rank=int(lora_cfg.get("r", 32)) if _dpo_lora_enabled else 0,
         )
         if _probe_model is not model:
