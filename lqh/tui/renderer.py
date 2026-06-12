@@ -184,6 +184,27 @@ def render_tool_result(tool_name: str, content: str, width: int = 100) -> str:
     return _render_block(render, width)
 
 
+def render_secret(text: str, width: int = 100) -> str:
+    """Render a one-time secret in a distinct, attention-grabbing panel.
+
+    Used for out-of-band secret delivery (e.g. a freshly minted inference key)
+    that must stand apart from normal tool output and is never logged.
+    """
+
+    def render(console: Console) -> None:
+        console.print(
+            Panel(
+                Text(text),
+                title="🔐 ONE-TIME SECRET — copy it now",
+                border_style="bold yellow",
+                expand=False,
+                padding=(0, 1),
+            )
+        )
+
+    return _render_block(render, width)
+
+
 def render_error(text: str, width: int = 100) -> str:
     """Render an error message."""
     return _render_block(

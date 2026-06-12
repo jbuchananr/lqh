@@ -216,8 +216,11 @@ class AgentCallbacks:
     on_agent_message: Callable[[str], Awaitable[None]] | None = None
     on_tool_call: Callable[[str, dict], Awaitable[None]] | None = None
     on_tool_result: Callable[[str, str], Awaitable[None]] | None = None
-    on_ask_user: Callable[[str, list[str] | None, bool], Awaitable[str]] | None = None
+    on_ask_user: Callable[..., Awaitable[str]] | None = None
     on_show_file: Callable[[str], Awaitable[str | None]] | None = None
+    # Show a one-time secret to the user out-of-band (e.g. a freshly minted
+    # inference key). Renders in a distinct panel; never enters the conversation.
+    on_show_secret: Callable[[str], Awaitable[None]] | None = None
     on_spinner_start: Callable[[], None] | None = None
     on_spinner_stop: Callable[[], None] | None = None
     on_token_update: Callable[[int, int], None] | None = None
@@ -862,6 +865,49 @@ class Agent:
                 )
             else:
                 return ToolResult(content="[No user input handler available]")
+
+        # One-time secret delivery (e.g. a freshly minted inference key). The
+        # plaintext rides on result.secret, NOT in result.content — we hand it
+        # to the user out-of-band and return a redacted message so the secret
+        # never reaches session.messages (local JSONL log or backend capture).
+        if (
+            result.requires_user_input
+            and result.content == "SECRET_DELIVERY_REQUIRED"
+            and result.secret is not None
+        ):
+            from lqh.env_secrets import append_env_secret
+
+            delivery = result.secret
+
+            def _append_env() -> str:
+                return append_env_secret(
+                    self.project_dir,
+                    delivery.env_var,
+                    delivery.payload,
+                    delivery.env_comment,
+                )
+
+            # Auto mode (no user to copy the key): default to .env append.
+            if self.auto_mode:
+                return ToolResult(content=delivery.redacted + _append_env())
+
+            # Interactive: show the key out-of-band, then offer to save it.
+            if self.callbacks.on_show_secret and self.callbacks.on_ask_user:
+                await self.callbacks.on_show_secret(delivery.display)
+                choice = await self.callbacks.on_ask_user(
+                    "Copy the key now — it will not be shown again.",
+                    result.options or ["Continue (hide key)", "Continue & append to .env"],
+                    False,
+                    allow_other=False,
+                )
+                note = ""
+                if ".env" in choice or "append" in choice.lower():
+                    note = _append_env()
+                return ToolResult(content=delivery.redacted + note)
+
+            # Headless fallback (no callbacks): persist to .env so the key is
+            # never lost, since it cannot be retrieved again.
+            return ToolResult(content=delivery.redacted + _append_env())
 
         # Handle show_file
         if result.show_file_path and self.callbacks.on_show_file:

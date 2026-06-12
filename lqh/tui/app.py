@@ -30,6 +30,7 @@ from lqh.tui.renderer import (
     render_error,
     render_file_view,
     render_options,
+    render_secret,
     render_system_message,
     render_tool_call,
     render_tool_result,
@@ -949,6 +950,7 @@ class LqhApp:
             on_tool_result=self._on_tool_result,
             on_ask_user=self._on_ask_user,
             on_show_file=self._on_show_file,
+            on_show_secret=self._on_show_secret,
             on_spinner_start=self._on_spinner_start,
             on_spinner_stop=self._on_spinner_stop,
             on_token_update=self._on_token_update,
@@ -1024,8 +1026,19 @@ class LqhApp:
     async def _on_tool_result(self, name: str, content: str) -> None:
         await self._emit(render_tool_result(name, content))
 
-    async def _on_ask_user(self, question: str, options: list[str] | None, multi_select: bool = False) -> str:
-        """Handle ask_user tool requests."""
+    async def _on_ask_user(
+        self,
+        question: str,
+        options: list[str] | None,
+        multi_select: bool = False,
+        allow_other: bool = True,
+    ) -> str:
+        """Handle ask_user tool requests.
+
+        ``allow_other=False`` suppresses the auto-injected "Other (please
+        specify)" free-text option — used for fixed-choice confirms (e.g. the
+        secret-delivery prompt) where free text makes no sense.
+        """
         await self._emit(render_agent_message(f"❓ {question}"))
 
         if options:
@@ -1034,10 +1047,10 @@ class LqhApp:
                 for option in options
                 if "other" not in option.lower() or "please specify" not in option.lower()
             ]
-            all_options = filtered + [OTHER_OPTION]
+            all_options = filtered + [OTHER_OPTION] if allow_other else filtered
             response = await self._wait_for_user_response(
                 options=all_options,
-                allow_other=True,
+                allow_other=allow_other,
                 multi_select=multi_select,
                 relock_after=True,
             )
@@ -1047,6 +1060,14 @@ class LqhApp:
             managed_text=render_system_message("Type your response:", separated=False),
             relock_after=True,
         )
+
+    async def _on_show_secret(self, text: str) -> None:
+        """Display a one-time secret in a distinct panel (out-of-band).
+
+        Never enters the conversation — the agent loop returns a redacted
+        message in its place.
+        """
+        await self._emit(render_secret(text))
 
     async def _on_show_file(self, path: str) -> str | None:
         """Display a file to the user. Returns viewer summary for parquet files."""

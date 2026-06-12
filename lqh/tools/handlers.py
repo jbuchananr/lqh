@@ -16,6 +16,31 @@ from lqh.skills import list_available_skills, load_skill_content
 TRUNCATION_THRESHOLD = 40_000
 
 
+# Sentinel content value: the tool produced a one-time secret that must be
+# delivered to the user out-of-band (never into the conversation). The agent
+# loop intercepts this (like PERMISSION_REQUIRED) and replaces the result with
+# the redacted message before anything is persisted. See SecretDelivery.
+SECRET_DELIVERY_REQUIRED = "SECRET_DELIVERY_REQUIRED"
+
+
+@dataclass
+class SecretDelivery:
+    """A one-time secret to hand to the user out-of-band.
+
+    Carried on a transient ``ToolResult`` whose ``content`` is the
+    ``SECRET_DELIVERY_REQUIRED`` sentinel. The agent loop shows ``display`` to
+    the user (TUI panel) and/or appends ``payload`` to ``.env``, then returns a
+    *new* ``ToolResult`` whose content is ``redacted`` — so the plaintext never
+    reaches ``session.messages`` (and therefore never the local JSONL log nor
+    the backend payload capture).
+    """
+    payload: str          # plaintext secret — out-of-band only, never logged
+    display: str          # full TUI message incl. the secret + "copy now" warning
+    redacted: str         # message that lands in the conversation (no secret)
+    env_var: str          # env var name for the optional .env append
+    env_comment: str | None = None  # comment line written above the .env entry
+
+
 @dataclass
 class ToolResult:
     """Result from a tool execution."""
@@ -30,6 +55,9 @@ class ToolResult:
     permission_key: str | None = None
     show_file_path: str | None = None
     skill_content: str | None = None
+    # Set with content==SECRET_DELIVERY_REQUIRED to hand a one-time secret to
+    # the user out-of-band. Never serialized into the conversation.
+    secret: SecretDelivery | None = None
     # Auto-mode signals. The agent loop checks these after each tool call.
     exit_auto_mode: bool = False
     auto_status: str | None = None  # "success" | "failure"
@@ -1756,28 +1784,54 @@ async def handle_create_inference_key(
         )
 
     key = data.get("key", "")
+    key_name = data.get("name") or name
+    key_id = data.get("id")
+    prefix = (key[:12] + "…") if len(key) > 12 else key
+
+    # Usage examples are identical for both messages; only the display embeds
+    # the real key (out-of-band), the redacted one keeps the placeholder.
+    usage = (
+        f"Usage (OpenAI-compatible, model = deployment name):\n"
+        f"  from openai import OpenAI\n"
+        f"  client = OpenAI(base_url=\"{_INFERENCE_ENDPOINT}\", "
+        f"api_key=\"<the key>\")\n"
+        f"  client.chat.completions.create(model=\"<deployment-name>\", "
+        f"messages=[...])"
+    )
+    display = (
+        f"🔑 Inference key created: {key_name} (id {key_id})\n"
+        f"\n"
+        f"  {key}\n"
+        f"\n"
+        f"⚠️ Copy it now — this is the ONLY time the plaintext key is shown. "
+        f"It cannot be retrieved again.\n"
+        f"\n"
+        f"  curl {_INFERENCE_ENDPOINT}/chat/completions \\\n"
+        f"    -H 'Authorization: Bearer {key}' \\\n"
+        f"    -H 'Content-Type: application/json' \\\n"
+        f"    -d '{{\"model\": \"<deployment-name>\", "
+        f"\"messages\": [{{\"role\": \"user\", \"content\": \"Hi\"}}]}}'\n"
+        f"\n"
+        f"{usage}"
+    )
+    redacted = (
+        f"🔑 Inference key \"{key_name}\" (id {key_id}, prefix {prefix}) created "
+        f"and delivered to the user. The plaintext is not available to you — it "
+        f"was shown once and is not retrievable.\n"
+        f"\n"
+        f"{usage}"
+    )
     return ToolResult(
-        content=(
-            f"🔑 Inference key created: {data.get('name')} (id {data.get('id')})\n"
-            f"\n"
-            f"  {key}\n"
-            f"\n"
-            f"⚠️ This is the ONLY time the plaintext key is shown — it cannot be "
-            f"retrieved again. Tell the user to store it now.\n"
-            f"\n"
-            f"Usage (OpenAI-compatible, model = deployment name):\n"
-            f"  curl {_INFERENCE_ENDPOINT}/chat/completions \\\n"
-            f"    -H 'Authorization: Bearer {key}' \\\n"
-            f"    -H 'Content-Type: application/json' \\\n"
-            f"    -d '{{\"model\": \"<deployment-name>\", "
-            f"\"messages\": [{{\"role\": \"user\", \"content\": \"Hi\"}}]}}'\n"
-            f"\n"
-            f"  from openai import OpenAI\n"
-            f"  client = OpenAI(base_url=\"{_INFERENCE_ENDPOINT}\", "
-            f"api_key=\"<the key>\")\n"
-            f"  client.chat.completions.create(model=\"<deployment-name>\", "
-            f"messages=[...])"
-        )
+        content=SECRET_DELIVERY_REQUIRED,
+        requires_user_input=True,
+        secret=SecretDelivery(
+            payload=key,
+            display=display,
+            redacted=redacted,
+            env_var="LQH_INFERENCE_KEY",
+            env_comment=f'# LQH inference key "{key_name}" (id {key_id})',
+        ),
+        options=["Continue (hide key)", "Continue & append to .env"],
     )
 
 

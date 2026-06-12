@@ -19,6 +19,13 @@ env/
 # lqh runtime data
 .lqh/
 
+# Local training data + lqh project working dirs (not package code)
+bvi-256-sft/
+bvi-full-20k/
+project3/
+project4/
+project5/
+
 # Deployment / local scripts
 build_and_deploy.sh
 
