@@ -8,7 +8,6 @@ import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
-from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
@@ -473,7 +472,7 @@ DATAGEN_AND_EVAL_TRANSLATION = Scenario(
 
 
 # ---------------------------------------------------------------------------
-# Scenario 4: Seeded spec+data → train on remote
+# Scenario 4: Seeded spec+data → train on cloud
 # ---------------------------------------------------------------------------
 
 async def seed_full_pipeline_async(project_dir: Path) -> None:
@@ -521,65 +520,30 @@ async def seed_full_pipeline_async(project_dir: Path) -> None:
         )
         logger.info("Seeded %s: %d/%d", name, result.succeeded, result.total)
 
-    # Seed remote: add BOTH global machine and project binding.
-    # Only seeding the project binding leaves an orphan that the agent
-    # cannot use — the global machine is required for get_remote() to resolve.
-    _seed_remote(project_dir, prefix="pipeline")
-
-
-def _get_remote_host() -> str | None:
-    """Get remote host from environment (set by test conftest/CLI)."""
-    import os
-    return os.environ.get("LQH_E2E_REMOTE_HOST")
-
-
-def _seed_remote(project_dir: Path, *, prefix: str) -> None:
-    """Register the E2E remote host globally and bind it to this project.
-
-    Reads ``LQH_E2E_REMOTE_HOST`` for the hostname.  The same value is used
-    as the remote name (so the agent can refer to it by that name).  Uses
-    ``lqh.remote.config.add_remote()`` which writes both layers atomically.
-    """
-    remote_host = _get_remote_host()
-    if not remote_host:
-        return
-
-    from lqh.remote.backend import RemoteConfig
-    from lqh.remote.config import add_remote
-
-    remote_root = f"/tmp/lqh-e2e-{prefix}-{uuid4().hex[:8]}"
-    config = RemoteConfig(
-        name=remote_host,
-        type="ssh_direct",
-        hostname=remote_host,
-        remote_root=remote_root,
-    )
-    add_remote(project_dir, config)
-    logger.info("Seeded remote %s -> %s", remote_host, remote_root)
+    from lqh.remote.compute import save_project_default
+    save_project_default(project_dir, "cloud")
 
 
 FULL_PIPELINE_TRANSLATION = Scenario(
     name="full_pipeline_translation",
     description=(
         "You are a user with an existing translation project that has spec, "
-        "training data, eval data, and a scorer ready. A remote GPU host is "
-        "ALREADY configured in the project — the agent should call remote_list "
-        "to discover it, NOT try to add a new one.\n\n"
+        "training data, eval data, and a scorer ready. LQH Cloud is the "
+        "project's compute target; the agent should call start_training "
+        "directly and let the tool route to cloud.\n\n"
         "Behavior rules:\n"
         "- When the agent shows project state, say 'let's fine-tune the model "
-        "on the configured remote GPU — check remote_list to find it'\n"
+        "on LQH Cloud using the held-out eval set and scorer'\n"
         "- When asked about training config, accept the defaults\n"
         "- When asked which base model, say 'LFM2.5-1.2B-Instruct'\n"
         "- If the agent suggests lfm2-8b or LFM2-8B, say that model is "
         "currently offline and to use LFM2.5-1.2B-Instruct instead\n"
         "- When asked about LoRA, say 'LoRA is fine'\n"
-        "- If the agent tries to add a new remote machine, stop it and say "
-        "'the remote is already configured, just use remote_list to find it'\n"
         "- Monitor training progress when the agent shows status updates\n"
         "- After training completes or evaluation results are shown, say 'I'm done for now'"
     ),
     initial_message=(
-        "I'd like to fine-tune a model on this data. Use the remote GPU."
+        "I'd like to fine-tune a model on this data using LQH Cloud."
     ),
     expected_tools=["summary", "read_file"],
     expected_files=["SPEC.md"],
@@ -774,7 +738,7 @@ DATAGEN_AND_EVAL_TOOLS_HELPDESK = Scenario(
 
 
 # ---------------------------------------------------------------------------
-# Scenario 8: Seeded tool-calling data → train on remote
+# Scenario 8: Seeded tool-calling data → train on cloud
 # ---------------------------------------------------------------------------
 
 async def seed_full_pipeline_tools_async(project_dir: Path) -> None:
@@ -828,31 +792,29 @@ async def seed_full_pipeline_tools_async(project_dir: Path) -> None:
         )
         logger.info("Seeded %s: %d/%d", name, result.succeeded, result.total)
 
-    # Seed remote (both global machine + project binding)
-    _seed_remote(project_dir, prefix="tools")
+    from lqh.remote.compute import save_project_default
+    save_project_default(project_dir, "cloud")
 
 
 FULL_PIPELINE_TOOLS = Scenario(
     name="full_pipeline_tools",
     description=(
         "You are a user with an existing tool-calling project (IT helpdesk) that "
-        "has spec, tool-calling training data, eval data, and a scorer. A remote "
-        "GPU host is ALREADY configured in the project — the agent should call "
-        "remote_list to discover it, NOT try to add a new one.\n\n"
+        "has spec, tool-calling training data, eval data, and a scorer. LQH "
+        "Cloud is the project's compute target; the agent should call "
+        "start_training directly and let the tool route to cloud.\n\n"
         "Behavior rules:\n"
         "- When the agent shows project state, say 'let's fine-tune the model "
-        "on the configured remote GPU — check remote_list to find it'\n"
+        "on LQH Cloud using the held-out eval set and scorer'\n"
         "- When asked about training config, accept the defaults\n"
         "- When asked which base model, say 'LFM2.5-1.2B-Instruct'\n"
         "- If the agent suggests lfm2-8b or LFM2-8B, say that model is "
         "currently offline and to use LFM2.5-1.2B-Instruct instead\n"
         "- When asked about LoRA, say 'LoRA is fine'\n"
-        "- If the agent tries to add a new remote machine, stop it and say "
-        "'the remote is already configured, just use remote_list to find it'\n"
         "- After training completes or results are shown, say 'I'm done for now'"
     ),
     initial_message=(
-        "Fine-tune a model on this tool-calling data using the remote GPU"
+        "Fine-tune a model on this tool-calling data using LQH Cloud"
     ),
     expected_tools=["summary", "read_file"],
     expected_files=["SPEC.md"],

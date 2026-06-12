@@ -435,18 +435,27 @@ def _forward_child_progress_row(
     )
 
 
+def _winner_model_dir(run_dir: Path) -> Path | None:
+    """Return the materialized sweep winner dir, preserving adapter names."""
+    for name in ("model", "model-lora"):
+        p = run_dir / name
+        if p.exists():
+            return p
+    return None
+
+
 def _build_eval_of_best_config(base: dict[str, Any], run_dir: Path) -> dict[str, Any] | None:
     """Compose the infer config the eval-of-best step runs against.
 
     Returns None when there's nothing to evaluate against — either no
     ``eval_dataset`` was supplied in the sweep's base config, or no
-    winner model has been materialized at ``run_dir/model`` yet.
+    winner model has been materialized at the run root yet.
     """
     eval_dataset = base.get("eval_dataset")
     if not eval_dataset:
         return None
-    model_path = run_dir / "model"
-    if not model_path.exists():
+    model_path = _winner_model_dir(run_dir)
+    if model_path is None:
         return None
     # Build a minimal lqh.infer config that matches what the rest of
     # the stack expects (matches the shape produced by
@@ -562,34 +571,41 @@ def _run_eval_of_best(run_dir: Path, base: dict[str, Any]) -> dict[str, Any]:
 
 
 def _materialize_best_model(winner_dir: Path, run_dir: Path) -> None:
-    """Expose the winner's model directly as ``run_dir/model``.
+    """Expose the winner's model directly at the sweep run root.
 
     Looks for ``winner_dir/model`` first (full / merged-LoRA case),
     falls back to ``winner_dir/model-lora`` (adapter-only LoRA case;
     sft.py:_save_final_model writes there when ``lora.merge`` is
     false). ``load_for_inference`` happily resolves an adapter dir
     (PeftModel + merge_and_unload), so eval-of-best works against
-    either layout — the only requirement is that *something* exists
-    at ``run_dir/model``.
+    either layout. The destination preserves the source directory name
+    so publish sees adapter checkpoints as ``model-lora.tar.gz``.
 
     Tries a symlink first (instant, no disk duplication). Falls back
     to ``shutil.copytree`` on filesystems that don't support symlinks.
     """
+    src: Path | None = None
+    dst_name: str | None = None
     for candidate in ("model", "model-lora"):
-        src = winner_dir / candidate
-        if src.exists():
+        candidate_path = winner_dir / candidate
+        if candidate_path.exists():
+            src = candidate_path
+            dst_name = candidate
             break
-    else:
+    if src is None or dst_name is None:
         return
-    dst = run_dir / "model"
+    dst = run_dir / dst_name
     # Clear any prior winner artifact (symlink or copy).
-    if dst.is_symlink() or dst.exists():
+    for stale_name in ("model", "model-lora"):
+        stale = run_dir / stale_name
+        if not (stale.is_symlink() or stale.exists()):
+            continue
         try:
-            if dst.is_symlink() or not dst.is_dir():
-                dst.unlink()
+            if stale.is_symlink() or not stale.is_dir():
+                stale.unlink()
             else:
                 import shutil
-                shutil.rmtree(dst)
+                shutil.rmtree(stale)
         except OSError:
             pass
     try:
@@ -635,11 +651,17 @@ def _write_sweep_summary(
     proxy_key: str,
     rows: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    total_elapsed_s = sum(
+        float(r["elapsed_s"])
+        for r in rows
+        if isinstance(r.get("elapsed_s"), (int, float))
+    )
     summary = {
         "mode": run_type,
         "grid_size": grid_size,
         "n_configs": n_configs,
         "n_completed": len(rows),
+        "total_elapsed_s": total_elapsed_s,
         "proxy_key": proxy_key,
         "collapse_threshold_delta_ref": COLLAPSE_DELTA_REF_THRESHOLD,
         "rows": rows,

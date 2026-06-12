@@ -25,6 +25,10 @@ class ModelResult:
     baseline: float | None = None
     sft: float | None = None
     dpo: float | None = None
+    sft_sweep_s: float | None = None
+    dpo_sweep_s: float | None = None
+    sft_training_runs: list[dict[str, Any]] = field(default_factory=list)
+    dpo_training_runs: list[dict[str, Any]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -53,6 +57,19 @@ def _fmt(v: float | None) -> str:
 
 def _fmt_delta(v: float | None) -> str:
     return "—" if v is None else f"{v:+.2f}"
+
+
+def _fmt_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "—"
+    seconds = max(0, float(seconds))
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m"
+    return f"{int(seconds)}s"
 
 
 def write_report(
@@ -112,8 +129,11 @@ def _render_md(meta: dict[str, Any], results: list[ModelResult]) -> str:
     for task in tasks:
         lines.append(f"## Task: {task}")
         lines.append("")
-        lines.append("| Model | Baseline | Best SFT | Best DPO | ΔSFT | ΔDPO | Best |")
-        lines.append("|---|---|---|---|---|---|---|")
+        lines.append(
+            "| Model | Baseline | Best SFT | Best DPO | ΔSFT | ΔDPO | "
+            "Best | SFT sweep | DPO sweep |"
+        )
+        lines.append("|---|---|---|---|---|---|---|---|---|")
         for model in models:
             r = by_key.get((task, model))
             if r is None:
@@ -121,7 +141,8 @@ def _render_md(meta: dict[str, Any], results: list[ModelResult]) -> str:
             lines.append(
                 f"| {model} | {_fmt(r.baseline)} | {_fmt(r.sft)} | {_fmt(r.dpo)} "
                 f"| {_fmt_delta(r.sft_delta)} | {_fmt_delta(r.dpo_delta)} "
-                f"| {_fmt(r.best)} |"
+                f"| {_fmt(r.best)} | {_fmt_duration(r.sft_sweep_s)} "
+                f"| {_fmt_duration(r.dpo_sweep_s)} |"
             )
         lines.append("")
         winner = _best_final(by_key, task, models)
@@ -165,6 +186,28 @@ def _render_md(meta: dict[str, Any], results: list[ModelResult]) -> str:
         lines.append("")
         for r, n in noted:
             lines.append(f"- `{r.task}/{r.model}`: {n}")
+        lines.append("")
+
+    timed = [
+        r for r in results
+        if r.sft_training_runs or r.dpo_training_runs
+    ]
+    if timed:
+        lines.append("## Training Duration Details")
+        lines.append("")
+        for r in timed:
+            if r.sft_training_runs:
+                parts = [
+                    f"{x.get('config_id', '?')}={_fmt_duration(x.get('elapsed_s'))}"
+                    for x in r.sft_training_runs
+                ]
+                lines.append(f"- `{r.task}/{r.model}` SFT configs: " + ", ".join(parts))
+            if r.dpo_training_runs:
+                parts = [
+                    f"{x.get('config_id', '?')}={_fmt_duration(x.get('elapsed_s'))}"
+                    for x in r.dpo_training_runs
+                ]
+                lines.append(f"- `{r.task}/{r.model}` DPO configs: " + ", ".join(parts))
         lines.append("")
 
     return "\n".join(lines)

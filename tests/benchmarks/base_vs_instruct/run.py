@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import time
@@ -43,6 +44,16 @@ from .report import ModelResult, write_report
 from .tasks import Task, resolve_tasks
 
 logger = logging.getLogger("bvi")
+
+
+def _suppress_noisy_http_logs() -> None:
+    """Keep long benchmark logs focused on benchmark progress.
+
+    This suppresses library log records only; HTTP/API exceptions still raise
+    normally and are handled by the caller.
+    """
+    for name in ("httpx", "httpcore", "openai", "openai._base_client"):
+        logging.getLogger(name).setLevel(logging.CRITICAL + 1)
 
 # Friendly key -> HuggingFace id. The 350M instruct variant has no -Instruct
 # suffix upstream (see BASE_VS_INSTRUCT.md).
@@ -113,7 +124,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--datagen-concurrency", type=int, default=20)
     p.add_argument("--max-new-tokens", type=int, default=512, help="eval generation cap")
     p.add_argument(
-        "--sweep-timeout", type=float, default=4 * 3600,
+        "--sweep-timeout", type=float, default=48 * 3600,
         help="per-sweep wall-clock timeout (seconds).",
     )
     p.add_argument(
@@ -146,16 +157,62 @@ def _resolve_models(spec: str) -> list[tuple[str, str]]:
 
 
 def _dataset_ready(data_parquet: Path, want_rows: int) -> bool:
+    rows = _dataset_rows(data_parquet)
+    return rows is not None and rows >= want_rows
+
+
+def _dataset_rows(data_parquet: Path) -> int | None:
     if not data_parquet.exists():
-        return False
+        return None
     try:
-        return pq.read_metadata(data_parquet).num_rows >= want_rows
+        return pq.read_metadata(data_parquet).num_rows
     except Exception:
-        return False
+        return None
 
 
 def _status_completed(run_dir: Path) -> bool:
     return SubprocessManager().get_status(run_dir).state == "completed"
+
+
+def _sweep_timing(run_dir: Path) -> dict:
+    """Read per-config and total training duration from sweep_summary.json."""
+    summary_path = run_dir / "sweep_summary.json"
+    if not summary_path.exists():
+        return {"sweep_s": None, "training_runs": []}
+    try:
+        summary = json.loads(summary_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {"sweep_s": None, "training_runs": []}
+
+    runs = []
+    for row in summary.get("rows", []):
+        if not isinstance(row, dict):
+            continue
+        elapsed = row.get("elapsed_s")
+        try:
+            elapsed_s = float(elapsed) if elapsed is not None else None
+        except (TypeError, ValueError):
+            elapsed_s = None
+        runs.append({
+            "config_id": row.get("config_id"),
+            "elapsed_s": elapsed_s,
+            "rc": row.get("rc"),
+            "primary": row.get("primary"),
+            "collapsed": row.get("collapsed", False),
+            "winner": (
+                isinstance(summary.get("winner"), dict)
+                and row.get("config_id") == summary["winner"].get("config_id")
+            ),
+        })
+
+    sweep_s = sum(
+        r["elapsed_s"] for r in runs
+        if isinstance(r.get("elapsed_s"), (int, float))
+    )
+    return {
+        "sweep_s": sweep_s if runs else None,
+        "training_runs": runs,
+    }
 
 
 def _ensure_dpo_dataset(workdir: Path, task: Task, n: int, *, resume: bool) -> str:
@@ -295,13 +352,13 @@ async def _run_sweep(
     grid_size: str,
     timeout: float,
     resume: bool,
-) -> Path:
+) -> tuple[Path, dict]:
     """Launch a local sweep subprocess, wait for completion, return winner dir."""
     run_dir = workdir / "runs" / run_name
     model_dir = run_dir / "model"
     if resume and model_dir.exists() and _status_completed(run_dir):
         logger.info("sweep %s: reusing completed winner", run_name)
-        return model_dir
+        return model_dir, _sweep_timing(run_dir)
 
     launch = {
         "type": "sweep",
@@ -319,7 +376,7 @@ async def _run_sweep(
             f"sweep:{run_name} completed but no winner model at {model_dir} "
             f"(all configs may have failed/collapsed; see {run_dir}/stderr.log)"
         )
-    return model_dir
+    return model_dir, _sweep_timing(run_dir)
 
 
 async def _ensure_datasets(
@@ -351,9 +408,17 @@ async def _ensure_datasets(
             client=client,
             concurrency=concurrency,
         )
-        logger.info("datagen %s: %d ok / %d failed", rel, res.succeeded, res.failed)
-        if res.succeeded == 0:
-            raise RuntimeError(f"datagen produced 0 samples for {rel}")
+        rows = _dataset_rows(data_parquet) or 0
+        logger.info(
+            "datagen %s: %d ok / %d failed; parquet rows=%d/%d",
+            rel, res.succeeded, res.failed, rows, n,
+        )
+        if rows < n:
+            raise RuntimeError(
+                f"datagen produced only {rows}/{n} rows for {rel} "
+                f"({res.succeeded} ok / {res.failed} failed). Refusing to run "
+                "a benchmark on a partial dataset."
+            )
 
     return (
         f"datasets/{task.name}_train/data.parquet",
@@ -390,7 +455,7 @@ async def _run_model_on_task(
 
     # 2) SFT sweep + eval of winner
     try:
-        sft_model = await _run_sweep(
+        sft_model, sft_timing = await _run_sweep(
             workdir=workdir, run_name=f"{tag}__sft",
             base_config=_base_config(
                 run_type="sft", base_model=hf_id,
@@ -398,10 +463,15 @@ async def _run_model_on_task(
                 train_size=args.train_size),
             grid_size=args.grid_size, timeout=args.sweep_timeout, resume=resume,
         )
+        result.sft_sweep_s = sft_timing["sweep_s"]
+        result.sft_training_runs = sft_timing["training_runs"]
         r = await eval_local(
             run_name=f"{tag}__sft_eval", model_path=str(sft_model.resolve()), **eval_kwargs)
         result.sft = r.mean
     except Exception as exc:
+        sft_timing = _sweep_timing(workdir / "runs" / f"{tag}__sft")
+        result.sft_sweep_s = sft_timing["sweep_s"]
+        result.sft_training_runs = sft_timing["training_runs"]
         logger.exception("SFT stage failed for %s", tag)
         result.notes.append(f"sft failed: {exc}")
         return result
@@ -428,7 +498,7 @@ async def _run_model_on_task(
         return result
     try:
         dpo_dataset_rel = _ensure_dpo_dataset(workdir, task, dpo_size, resume=resume)
-        dpo_model = await _run_sweep(
+        dpo_model, dpo_timing = await _run_sweep(
             workdir=workdir, run_name=f"{tag}__dpo",
             base_config=_base_config(
                 run_type="on_policy_dpo", base_model=f"runs/{tag}__sft/model",
@@ -436,10 +506,15 @@ async def _run_model_on_task(
                 train_size=dpo_size),
             grid_size=args.grid_size, timeout=args.sweep_timeout, resume=resume,
         )
+        result.dpo_sweep_s = dpo_timing["sweep_s"]
+        result.dpo_training_runs = dpo_timing["training_runs"]
         r = await eval_local(
             run_name=f"{tag}__dpo_eval", model_path=str(dpo_model.resolve()), **eval_kwargs)
         result.dpo = r.mean
     except Exception as exc:
+        dpo_timing = _sweep_timing(workdir / "runs" / f"{tag}__dpo")
+        result.dpo_sweep_s = dpo_timing["sweep_s"]
+        result.dpo_training_runs = dpo_timing["training_runs"]
         logger.exception("DPO stage failed for %s", tag)
         result.notes.append(f"dpo failed: {exc}")
 
@@ -452,6 +527,7 @@ async def _main_async(args: argparse.Namespace) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    _suppress_noisy_http_logs()
 
     token = get_token()
     if not token:

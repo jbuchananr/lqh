@@ -883,6 +883,254 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
             },
         ),
         # ------------------------------------------------------------------
+        # push_to_production
+        # ------------------------------------------------------------------
+        _tool(
+            name="push_to_production",
+            description=(
+                "Deploy a trained checkpoint artifact as a live inference endpoint "
+                "on LQH Cloud. The model is served OpenAI-compatible at "
+                "https://inference.lqh.ai/v1 with the deployment name as the model id. "
+                "LoRA checkpoint artifacts are auto-merged into their base model "
+                "first (status: pending → merging → deploying → running); full "
+                "fine-tunes skip the merge (pending → deploying → running). Billing "
+                "is per GPU-hour while the deployment runs. Use this after training "
+                "when the user wants to serve the model — find the checkpoint's "
+                "artifact ID via 'artifacts' (action=list), then create an access "
+                "key with create_inference_key so the user can call the endpoint."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "artifact_id": {
+                        "type": "string",
+                        "description": (
+                            "ID of the checkpoint artifact to deploy (from "
+                            "'artifacts' action=list). LoRA and full checkpoints "
+                            "both work."
+                        ),
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": (
+                            "Deployment name — this becomes the model id clients "
+                            "pass to the OpenAI-compatible endpoint. Must be unique; "
+                            "use a short descriptive slug (e.g. 'summarizer-v2')."
+                        ),
+                    },
+                    "tier": {
+                        "type": "string",
+                        "enum": ["debug", "prod"],
+                        "description": (
+                            "'debug' (default) for cheap testing; 'prod' for "
+                            "customer-facing traffic. Only use 'prod' when the user "
+                            "explicitly asks for a production deployment."
+                        ),
+                        "default": "debug",
+                    },
+                    "gpu_type": {
+                        "type": "string",
+                        "description": (
+                            "GPU type to serve on. Omit to let the backend pick a "
+                            "sensible default for the model size."
+                        ),
+                    },
+                    "min_containers": {
+                        "type": "integer",
+                        "description": (
+                            "Minimum number of serving containers. 0 allows "
+                            "scale-to-zero (cold starts); omit for the default."
+                        ),
+                    },
+                    "max_containers": {
+                        "type": "integer",
+                        "description": (
+                            "Maximum number of serving containers for autoscaling. "
+                            "Omit for the default."
+                        ),
+                    },
+                    "project_id": {
+                        "type": "string",
+                        "description": (
+                            "Project to attribute the deployment to. Defaults to "
+                            "the current project."
+                        ),
+                    },
+                    "artifact_format": {
+                        "type": "string",
+                        "enum": ["lora", "full"],
+                        "description": (
+                            "Override the artifact classification when its lineage "
+                            "is missing or wrong (e.g. a LoRA adapter that was "
+                            "published as model.tar.gz). Usually omit."
+                        ),
+                    },
+                    "base_model": {
+                        "type": "string",
+                        "description": (
+                            "HF id the adapter merges onto at boot, e.g. "
+                            "'LiquidAI/LFM2.5-1.2B-Instruct'. Required for LoRA "
+                            "artifacts whose lineage lacks base_model; ignored for "
+                            "full checkpoints."
+                        ),
+                    },
+                },
+                "required": ["artifact_id", "name"],
+            },
+        ),
+        # ------------------------------------------------------------------
+        # list_deployments
+        # ------------------------------------------------------------------
+        _tool(
+            name="list_deployments",
+            description=(
+                "List all inference deployments for the account: name, status, "
+                "tier, GPU, estimated $/hr, and billed cost to date. Use this to "
+                "check what is currently serving (and costing money) before "
+                "creating, stopping, or restarting deployments."
+            ),
+        ),
+        # ------------------------------------------------------------------
+        # get_deployment
+        # ------------------------------------------------------------------
+        _tool(
+            name="get_deployment",
+            description=(
+                "Get one deployment's full status plus a current-period usage "
+                "summary (requests, errors, tokens, latency, GPU cost). Use this "
+                "to track a deployment through its merge/deploy phases after "
+                "push_to_production, or to report traffic and spend to the user."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "deployment_id": {
+                        "type": "string",
+                        "description": "ID of the deployment to inspect.",
+                    },
+                },
+                "required": ["deployment_id"],
+            },
+        ),
+        # ------------------------------------------------------------------
+        # stop_deployment
+        # ------------------------------------------------------------------
+        _tool(
+            name="stop_deployment",
+            description=(
+                "Stop a running deployment. GPU billing stops; the deployment's "
+                "name and configuration are kept so it can be brought back with "
+                "restart_deployment. Use when the user is done testing or wants "
+                "to cut costs."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "deployment_id": {
+                        "type": "string",
+                        "description": "ID of the deployment to stop.",
+                    },
+                },
+                "required": ["deployment_id"],
+            },
+        ),
+        # ------------------------------------------------------------------
+        # restart_deployment
+        # ------------------------------------------------------------------
+        _tool(
+            name="restart_deployment",
+            description=(
+                "Restart a stopped (or errored) deployment. GPU billing resumes "
+                "once it is running again. The endpoint and model name stay the "
+                "same, so existing inference keys keep working."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "deployment_id": {
+                        "type": "string",
+                        "description": "ID of the deployment to restart.",
+                    },
+                },
+                "required": ["deployment_id"],
+            },
+        ),
+        # ------------------------------------------------------------------
+        # create_inference_key
+        # ------------------------------------------------------------------
+        _tool(
+            name="create_inference_key",
+            description=(
+                "Create an inference API key (lqh_inf_...) for the customer-facing "
+                "endpoint https://inference.lqh.ai/v1. The plaintext key is returned "
+                "ONCE in this call and can never be retrieved again — relay it to "
+                "the user immediately. By default the key grants access to all of "
+                "the org's deployments; pass deployment_ids to scope it to "
+                "specific ones. Use after push_to_production so the user can "
+                "actually call their deployed model."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": (
+                            "Human-readable name for the key (e.g. 'staging', "
+                            "'acme-customer')."
+                        ),
+                    },
+                    "deployment_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Deployment IDs this key may access. If omitted, the "
+                            "key is created with access to all deployments."
+                        ),
+                    },
+                    "all_deployments": {
+                        "type": "boolean",
+                        "description": (
+                            "Grant access to every deployment (including future "
+                            "ones). Defaults to true when deployment_ids is omitted."
+                        ),
+                    },
+                },
+                "required": ["name"],
+            },
+        ),
+        # ------------------------------------------------------------------
+        # list_inference_keys
+        # ------------------------------------------------------------------
+        _tool(
+            name="list_inference_keys",
+            description=(
+                "List the org's inference API keys: name, prefix, scope, and "
+                "revocation status. Plaintext keys are never shown here — only "
+                "create_inference_key returns one, and only once."
+            ),
+        ),
+        # ------------------------------------------------------------------
+        # revoke_inference_key
+        # ------------------------------------------------------------------
+        _tool(
+            name="revoke_inference_key",
+            description=(
+                "Revoke an inference API key immediately. Requests using it will "
+                "start failing with 401. This cannot be undone — create a new key "
+                "if access is needed again."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "key_id": {
+                        "type": "string",
+                        "description": "ID of the inference key to revoke.",
+                    },
+                },
+                "required": ["key_id"],
+            },
+        ),
+        # ------------------------------------------------------------------
         # start_training
         # ------------------------------------------------------------------
         _tool(

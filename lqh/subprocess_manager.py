@@ -160,8 +160,16 @@ class SubprocessManager:
         if pid is None:
             return False
 
+        def _signal(sig: signal.Signals) -> None:
+            try:
+                os.killpg(pid, sig)
+            except ProcessLookupError:
+                raise
+            except OSError:
+                os.kill(pid, sig)
+
         try:
-            os.kill(pid, signal.SIGTERM)
+            _signal(signal.SIGTERM)
         except ProcessLookupError:
             return True
 
@@ -175,7 +183,7 @@ class SubprocessManager:
 
         # Still alive — force kill.
         try:
-            os.kill(pid, signal.SIGKILL)
+            _signal(signal.SIGKILL)
         except ProcessLookupError:
             pass
         return True

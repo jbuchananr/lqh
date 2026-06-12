@@ -33,6 +33,44 @@ from lqh.train.resume import train_with_checkpoint_fallback
 
 
 # ---------------------------------------------------------------------------
+# Lineage sidecars
+# ---------------------------------------------------------------------------
+
+
+def _write_checkpoint_lineage(
+    model_dir: Path,
+    *,
+    config: dict[str, Any],
+    training_method: str,
+) -> None:
+    """Write metadata consumed by lqh.remote.publish for checkpoint artifacts."""
+    training_cfg = config.get("training", {})
+    lora_cfg = config.get("lora", {})
+    hyperparams: dict[str, Any] = {
+        "learning_rate": training_cfg.get("learning_rate"),
+        "num_epochs": training_cfg.get("num_epochs"),
+        "max_seq_length": training_cfg.get("max_seq_length"),
+    }
+    if lora_cfg.get("enabled", True):
+        hyperparams.update(
+            {
+                "lora_r": lora_cfg.get("r", 32),
+                "lora_alpha": lora_cfg.get("alpha", 64),
+                "lora_dropout": lora_cfg.get("dropout", 0.02),
+                "lora_base": config.get("base_model"),
+            }
+        )
+    lineage = {
+        "artifact_kind": "checkpoint",
+        "training_method": training_method,
+        "base_model": config.get("base_model"),
+        "hyperparams": hyperparams,
+        "parent_ids": [],
+    }
+    (model_dir / "lineage.json").write_text(json.dumps(lineage, indent=2) + "\n")
+
+
+# ---------------------------------------------------------------------------
 # Callback: writes progress.jsonl and handles checkpoint eval
 # ---------------------------------------------------------------------------
 
@@ -448,6 +486,11 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
         trainer.model.save_pretrained(str(final_model_dir))
 
     tokenizer.save_pretrained(str(final_model_dir))
+    _write_checkpoint_lineage(
+        final_model_dir,
+        config=config,
+        training_method="lora" if saving_adapter else "full",
+    )
 
     print(f"Model saved to {final_model_dir}")
 

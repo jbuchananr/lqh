@@ -1420,6 +1420,426 @@ async def handle_artifacts(
         return ToolResult(content=f"Error: {e}")
 
 
+# ----------------------------------------------------------------------
+# Inference deployments + keys (LQH Cloud serving).
+# Thin clients over the backend's /v1/deployments and /v1/inference-keys
+# endpoints; deployed models are served OpenAI-compatible at
+# https://inference.lqh.ai/v1 with the deployment name as the model id.
+# ----------------------------------------------------------------------
+
+_INFERENCE_ENDPOINT = "https://inference.lqh.ai/v1"
+
+
+def _fmt_usd_micros(micros: Any) -> str:
+    """Format a micros amount (margin already applied by the backend) as dollars."""
+    if micros is None:
+        return "$?"
+    dollars = micros / 1_000_000
+    if dollars != 0 and abs(dollars) < 1:
+        return f"${dollars:.3f}"
+    return f"${dollars:,.2f}"
+
+
+def _fmt_count(value: Any, default: str = "0") -> str:
+    if value is None:
+        return default
+    try:
+        return f"{float(value):,.0f}"
+    except (TypeError, ValueError):
+        return default
+
+
+def _fmt_float(value: Any, fmt: str, default: str = "n/a") -> str:
+    if value is None:
+        return default
+    try:
+        return format(float(value), fmt)
+    except (TypeError, ValueError):
+        return default
+
+
+def _api_error_message(status: int, data: Any) -> str:
+    """Pull a human-readable message out of a backend error body."""
+    if isinstance(data, dict):
+        err = data.get("error")
+        if isinstance(err, dict) and err.get("message"):
+            return str(err["message"])
+        if isinstance(err, str) and err:
+            return err
+        if data.get("message"):
+            return str(data["message"])
+    return f"HTTP {status}"
+
+
+async def _backend_json(
+    method: str,
+    path: str,
+    *,
+    json_body: dict[str, Any] | None = None,
+    params: dict[str, Any] | None = None,
+) -> tuple[int, Any]:
+    """Authenticated JSON request against the backend (api_root() + /v1 path)."""
+    import httpx
+
+    from lqh.auth import api_root, require_token
+
+    token = require_token()
+    async with httpx.AsyncClient(base_url=api_root(), timeout=60.0) as client:
+        r = await client.request(
+            method,
+            path,
+            json=json_body,
+            params=params,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    try:
+        data = r.json()
+    except Exception:
+        data = {"message": r.text[:300]}
+    return r.status_code, data
+
+
+def _deployment_gpu(dep: dict[str, Any]) -> str:
+    gpu_type = dep.get("gpu_type") or "?"
+    count = dep.get("gpu_count") or 1
+    return f"{count}x {gpu_type}"
+
+
+async def handle_push_to_production(
+    project_dir: Path,
+    *,
+    artifact_id: str,
+    name: str,
+    tier: str = "debug",
+    gpu_type: str | None = None,
+    min_containers: int | None = None,
+    max_containers: int | None = None,
+    project_id: str | None = None,
+    artifact_format: str | None = None,
+    base_model: str | None = None,
+    **kwargs: Any,
+) -> ToolResult:
+    """Deploy a checkpoint artifact as a serving endpoint on LQH Cloud."""
+    body: dict[str, Any] = {
+        "name": name,
+        "artifact_id": artifact_id,
+        "tier": tier,
+        "project_id": project_id or project_dir.name,
+    }
+    if gpu_type:
+        body["gpu_type"] = gpu_type
+    if min_containers is not None:
+        body["min_containers"] = min_containers
+    if max_containers is not None:
+        body["max_containers"] = max_containers
+    if artifact_format:
+        body["artifact_format"] = artifact_format
+    if base_model:
+        body["base_model"] = base_model
+
+    try:
+        status, data = await _backend_json("POST", "/v1/deployments", json_body=body)
+    except Exception as e:  # noqa: BLE001 - surface clearly to the agent
+        return ToolResult(content=f"Error: {e}")
+
+    if status == 402:
+        return ToolResult(
+            content=(
+                "❌ Out of credits — the deployment was not created. The org has "
+                "insufficient credits to run a GPU deployment; top up and retry."
+            )
+        )
+    if status == 409:
+        return ToolResult(
+            content=(
+                f"❌ Deployment name '{name}' is already taken. Pick a different "
+                "name (list_deployments shows the existing ones) and retry."
+            )
+        )
+    if status not in (200, 201):
+        return ToolResult(
+            content=f"Error creating deployment: {_api_error_message(status, data)}"
+        )
+
+    dep = data
+    return ToolResult(
+        content=(
+            f"🚀 Deployment created\n"
+            f"  ID:       {dep.get('id')}\n"
+            f"  Name:     {dep.get('name')}\n"
+            f"  Status:   {dep.get('status')} (LoRA checkpoints auto-merge first: "
+            f"pending → merging → deploying → running; full fine-tunes skip merging)\n"
+            f"  Tier:     {dep.get('tier')}\n"
+            f"  GPU:      {_deployment_gpu(dep)}\n"
+            f"  Est. cost: {_fmt_usd_micros(dep.get('billed_per_hour_estimate'))}/hr while running\n"
+            f"\n"
+            f"Once status is 'running', the model is served OpenAI-compatible at:\n"
+            f"  Endpoint: {_INFERENCE_ENDPOINT}\n"
+            f"  Model:    {dep.get('name')}\n"
+            f"\n"
+            f"Authentication needs an inference key — create one with "
+            f"create_inference_key. Track progress with get_deployment."
+        )
+    )
+
+
+async def handle_list_deployments(project_dir: Path, **kwargs: Any) -> ToolResult:
+    """List all inference deployments with status and cost."""
+    try:
+        status, data = await _backend_json("GET", "/v1/deployments")
+    except Exception as e:  # noqa: BLE001
+        return ToolResult(content=f"Error: {e}")
+    if status != 200:
+        return ToolResult(
+            content=f"Error listing deployments: {_api_error_message(status, data)}"
+        )
+
+    deployments = data.get("deployments") or []
+    if not deployments:
+        return ToolResult(
+            content=(
+                "No deployments. Use push_to_production to deploy a trained "
+                "checkpoint artifact."
+            )
+        )
+
+    lines = [f"Deployments ({len(deployments)}):"]
+    for dep in deployments:
+        lines.append(
+            f"  - {dep.get('name')}  [{dep.get('status')}]  tier={dep.get('tier')}  "
+            f"gpu={_deployment_gpu(dep)}  "
+            f"{_fmt_usd_micros(dep.get('billed_per_hour_estimate'))}/hr est  "
+            f"billed to date {_fmt_usd_micros(dep.get('billed_cost_micros'))}"
+        )
+        lines.append(f"      id: {dep.get('id')}")
+        if dep.get("error"):
+            lines.append(f"      ⚠️ error: {dep['error']}")
+    lines.append("")
+    lines.append(f"Endpoint: {_INFERENCE_ENDPOINT} (model = deployment name)")
+    return ToolResult(content="\n".join(lines))
+
+
+async def handle_get_deployment(
+    project_dir: Path, *, deployment_id: str, **kwargs: Any,
+) -> ToolResult:
+    """Show one deployment plus its current-period usage summary."""
+    try:
+        status, dep = await _backend_json("GET", f"/v1/deployments/{deployment_id}")
+    except Exception as e:  # noqa: BLE001
+        return ToolResult(content=f"Error: {e}")
+    if status != 200:
+        return ToolResult(
+            content=f"Error fetching deployment: {_api_error_message(status, dep)}"
+        )
+
+    lines = [
+        f"Deployment {dep.get('name')} ({dep.get('id')}):",
+        f"  Status:    {dep.get('status')} (desired: {dep.get('desired_status')})",
+        f"  Tier:      {dep.get('tier')}",
+        f"  Base model: {dep.get('base_model')}",
+        f"  GPU:       {_deployment_gpu(dep)}  "
+        f"(containers {dep.get('min_containers')}-{dep.get('max_containers')}"
+        + (f", replicas {dep.get('replicas')}" if dep.get("replicas") is not None else "")
+        + ")",
+        f"  Est. cost: {_fmt_usd_micros(dep.get('billed_per_hour_estimate'))}/hr",
+        f"  Billed to date: {_fmt_usd_micros(dep.get('billed_cost_micros'))} "
+        f"({_fmt_count(dep.get('gpu_seconds'))} GPU-seconds)",
+        f"  Created:   {dep.get('created_at')}",
+    ]
+    if dep.get("error"):
+        lines.append(f"  ⚠️ Error:  {dep['error']}")
+    lines.append(f"  Endpoint:  {_INFERENCE_ENDPOINT}  (model = '{dep.get('name')}')")
+
+    # Usage summary is best-effort — the deployment view is still useful
+    # if the usage endpoint fails.
+    try:
+        ustatus, usage = await _backend_json(
+            "GET",
+            f"/v1/deployments/{deployment_id}/usage",
+            params={"range": "current_period"},
+        )
+    except Exception as e:  # noqa: BLE001
+        ustatus, usage = 0, {"message": str(e)}
+    if ustatus == 200:
+        totals = usage.get("totals") or {}
+        lines.append("")
+        lines.append("Usage (current period):")
+        lines.append(
+            f"  Requests:  {_fmt_count(totals.get('requests'))} "
+            f"({_fmt_count(totals.get('errors'))} errors)"
+        )
+        lines.append(
+            f"  Tokens:    {_fmt_count(totals.get('input_tokens'))} in / "
+            f"{_fmt_count(totals.get('output_tokens'))} out"
+        )
+        lines.append(
+            f"  Latency:   avg TTFT {_fmt_float(totals.get('avg_ttft_ms'), '.0f')} ms, "
+            f"avg duration {_fmt_float(totals.get('avg_duration'), '.2f')} s"
+        )
+        lines.append(
+            f"  GPU cost:  {_fmt_usd_micros(usage.get('billed_gpu_cost_micros'))} "
+            f"({_fmt_count(usage.get('gpu_seconds'))} GPU-seconds)"
+        )
+    else:
+        lines.append("")
+        lines.append(f"(usage unavailable: {_api_error_message(ustatus, usage)})")
+    return ToolResult(content="\n".join(lines))
+
+
+async def _deployment_action(deployment_id: str, action: str, emoji: str) -> ToolResult:
+    try:
+        status, dep = await _backend_json(
+            "POST", f"/v1/deployments/{deployment_id}/{action}",
+        )
+    except Exception as e:  # noqa: BLE001
+        return ToolResult(content=f"Error: {e}")
+    if status != 200:
+        return ToolResult(
+            content=f"Error on {action}: {_api_error_message(status, dep)}"
+        )
+    return ToolResult(
+        content=(
+            f"{emoji} Deployment '{dep.get('name')}' {action} requested — "
+            f"status: {dep.get('status')} (desired: {dep.get('desired_status')}). "
+            f"Billed to date: {_fmt_usd_micros(dep.get('billed_cost_micros'))}. "
+            f"Check with get_deployment."
+        )
+    )
+
+
+async def handle_stop_deployment(
+    project_dir: Path, *, deployment_id: str, **kwargs: Any,
+) -> ToolResult:
+    """Stop a running deployment (GPU billing stops)."""
+    return await _deployment_action(deployment_id, "stop", "🛑")
+
+
+async def handle_restart_deployment(
+    project_dir: Path, *, deployment_id: str, **kwargs: Any,
+) -> ToolResult:
+    """Restart a stopped deployment (GPU billing resumes)."""
+    return await _deployment_action(deployment_id, "restart", "🔄")
+
+
+async def handle_create_inference_key(
+    project_dir: Path,
+    *,
+    name: str,
+    deployment_ids: list[str] | None = None,
+    all_deployments: bool | None = None,
+    **kwargs: Any,
+) -> ToolResult:
+    """Create an inference API key; the plaintext is shown exactly once."""
+    body: dict[str, Any] = {"name": name}
+    if deployment_ids:
+        body["deployment_ids"] = deployment_ids
+        if all_deployments:
+            body["all_deployments"] = True
+    else:
+        # No explicit scope → grant access to all deployments.
+        body["all_deployments"] = True if all_deployments is None else all_deployments
+
+    try:
+        status, data = await _backend_json("POST", "/v1/inference-keys", json_body=body)
+    except Exception as e:  # noqa: BLE001
+        return ToolResult(content=f"Error: {e}")
+    if status == 403:
+        return ToolResult(
+            content=(
+                "❌ The org has reached its inference-key cap. Revoke an unused "
+                "key (list_inference_keys / revoke_inference_key) and retry."
+            )
+        )
+    if status not in (200, 201):
+        return ToolResult(
+            content=f"Error creating inference key: {_api_error_message(status, data)}"
+        )
+
+    key = data.get("key", "")
+    return ToolResult(
+        content=(
+            f"🔑 Inference key created: {data.get('name')} (id {data.get('id')})\n"
+            f"\n"
+            f"  {key}\n"
+            f"\n"
+            f"⚠️ This is the ONLY time the plaintext key is shown — it cannot be "
+            f"retrieved again. Tell the user to store it now.\n"
+            f"\n"
+            f"Usage (OpenAI-compatible, model = deployment name):\n"
+            f"  curl {_INFERENCE_ENDPOINT}/chat/completions \\\n"
+            f"    -H 'Authorization: Bearer {key}' \\\n"
+            f"    -H 'Content-Type: application/json' \\\n"
+            f"    -d '{{\"model\": \"<deployment-name>\", "
+            f"\"messages\": [{{\"role\": \"user\", \"content\": \"Hi\"}}]}}'\n"
+            f"\n"
+            f"  from openai import OpenAI\n"
+            f"  client = OpenAI(base_url=\"{_INFERENCE_ENDPOINT}\", "
+            f"api_key=\"<the key>\")\n"
+            f"  client.chat.completions.create(model=\"<deployment-name>\", "
+            f"messages=[...])"
+        )
+    )
+
+
+async def handle_list_inference_keys(project_dir: Path, **kwargs: Any) -> ToolResult:
+    """List inference API keys (no plaintext — only prefixes)."""
+    try:
+        status, data = await _backend_json("GET", "/v1/inference-keys")
+    except Exception as e:  # noqa: BLE001
+        return ToolResult(content=f"Error: {e}")
+    if status != 200:
+        return ToolResult(
+            content=f"Error listing inference keys: {_api_error_message(status, data)}"
+        )
+
+    keys = data.get("keys") or []
+    if not keys:
+        return ToolResult(
+            content="No inference keys. Create one with create_inference_key."
+        )
+    lines = [f"Inference keys ({len(keys)}):"]
+    for k in keys:
+        if k.get("all_deployments"):
+            scope = "all deployments"
+        else:
+            ids = k.get("deployment_ids") or []
+            scope = f"{len(ids)} deployment(s)"
+        flags = []
+        if k.get("revoked_at") or k.get("revoked"):
+            flags.append("REVOKED")
+        if k.get("expires_at"):
+            flags.append(f"expires {k['expires_at']}")
+        suffix = f"  ({', '.join(flags)})" if flags else ""
+        lines.append(
+            f"  - {k.get('name')}  {k.get('prefix')}…  {scope}{suffix}"
+        )
+        lines.append(f"      id: {k.get('id')}")
+    return ToolResult(content="\n".join(lines))
+
+
+async def handle_revoke_inference_key(
+    project_dir: Path, *, key_id: str, **kwargs: Any,
+) -> ToolResult:
+    """Revoke an inference API key immediately."""
+    try:
+        status, data = await _backend_json(
+            "POST", f"/v1/inference-keys/{key_id}/revoke",
+        )
+    except Exception as e:  # noqa: BLE001
+        return ToolResult(content=f"Error: {e}")
+    if status != 200:
+        return ToolResult(
+            content=f"Error revoking key: {_api_error_message(status, data)}"
+        )
+    return ToolResult(
+        content=(
+            f"🗑️ Revoked inference key '{data.get('name')}' ({data.get('id')}). "
+            "Requests using it will now fail; create a new key with "
+            "create_inference_key if access is needed again."
+        )
+    )
+
+
 def _resolve_hf_pull_repo_type(api, repo_id: str, explicit: str | None) -> tuple[str | None, str | None]:
     """Determine repo_type for hf_pull. Returns (repo_type, error_message)."""
     if explicit is not None:
@@ -4110,6 +4530,14 @@ TOOL_HANDLERS: dict[str, Callable[..., Awaitable[ToolResult]]] = {
     "pull": handle_pull,
     "push": handle_push,
     "artifacts": handle_artifacts,
+    "push_to_production": handle_push_to_production,
+    "list_deployments": handle_list_deployments,
+    "get_deployment": handle_get_deployment,
+    "stop_deployment": handle_stop_deployment,
+    "restart_deployment": handle_restart_deployment,
+    "create_inference_key": handle_create_inference_key,
+    "list_inference_keys": handle_list_inference_keys,
+    "revoke_inference_key": handle_revoke_inference_key,
     "start_training": handle_start_training,
     "training_status": handle_training_status,
     "stop_training": handle_stop_training,

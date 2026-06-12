@@ -61,6 +61,16 @@ def test_build_eval_config_carries_required_fields(tmp_path: Path):
     assert "scorer" in cfg["manifest"]
 
 
+def test_build_eval_config_accepts_lora_winner_dir(tmp_path: Path):
+    (tmp_path / "model-lora").mkdir()
+    base = {"eval_dataset": "datasets/heldout"}
+
+    cfg = sweep._build_eval_of_best_config(base, tmp_path)
+
+    assert cfg is not None
+    assert cfg["base_model"].endswith("/model-lora")
+
+
 def test_build_eval_config_skips_when_no_eval_dataset(tmp_path: Path):
     (tmp_path / "model").mkdir()
     base = {"type": "sft", "base_model": "x", "dataset": "datasets/train"}
@@ -183,3 +193,17 @@ def test_eval_of_best_overwrites_existing_predictions(tmp_path: Path, monkeypatc
     # Updated to the fresh bytes — either via symlink-replace or
     # copy-with-overwrite; the test asserts the observable result.
     assert (tmp_path / "predictions.parquet").read_bytes() == b"NEW"
+
+
+def test_materialize_best_model_preserves_lora_dir_name(tmp_path: Path):
+    winner = tmp_path / "winner"
+    run_dir = tmp_path / "run"
+    lora_dir = winner / "model-lora"
+    lora_dir.mkdir(parents=True)
+    (lora_dir / "adapter_config.json").write_text("{}")
+    (run_dir / "model").mkdir(parents=True)
+
+    sweep._materialize_best_model(winner, run_dir)
+
+    assert (run_dir / "model-lora").exists()
+    assert not (run_dir / "model").exists()

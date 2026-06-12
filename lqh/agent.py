@@ -49,6 +49,8 @@ criteria while feedback is fresh, then generate a validation set (100-500 sample
 6. **Fine-tuning** (`/train`) — SFT on training data (requires torch)
 7. **On-policy iteration** — Eval fine-tuned model, extract failure cases, generate \
 targeted training data for failures, re-train. Repeat until scores plateau.
+8. **Deployment** — Serve the best checkpoint as an OpenAI-compatible endpoint with \
+`push_to_production`, then `create_inference_key` so the user can call it.
 
 **You do NOT need to run every step.** If performance is good enough after any step, \
 stop and suggest deployment. The user may also jump to a specific step or skip steps. \

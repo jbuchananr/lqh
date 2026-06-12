@@ -15,14 +15,7 @@ from __future__ import annotations
 
 import random
 
-from lqh.pipeline import (
-    ChatMLMessage,
-    Conversation,
-    GenerationError,
-    Pipeline,
-    safe_content,
-    step,
-)
+from lqh.pipeline import ChatMLMessage, Conversation, Pipeline, step
 
 SYSTEM_PROMPT = (
     "Rewrite customer-support replies to match the requested tone and style. "
@@ -88,29 +81,13 @@ class StyleRewritePipeline(Pipeline):
 
     @step(retries=4)
     async def _make_draft(self, client) -> None:
-        prompt = (
-            "Write a flawed customer-support reply about this issue. Make it "
-            "somewhat wordy and include at least one of the banned phrases.\n\n"
-            f"Issue: {self.issue}\n"
-            "Facts that must be preserved:\n"
-            + "\n".join(f"- {fact}" for fact in self.facts)
-            + "\nBanned phrases to include at least one of:\n"
-            + "\n".join(f"- {phrase}" for phrase in self.banned)
-            + "\n\nOutput only the flawed draft."
+        draft = (
+            f"{self.banned[0].capitalize()}. Regarding {self.issue}, "
+            f"please be advised that {self.facts[0]}. Also, {self.facts[1]}. "
+            f"{self.banned[1].capitalize()}. We wanted to circle back with "
+            "this update and make sure you understand that the request is "
+            "being handled through the normal support process."
         )
-        resp = await client.chat.completions.create(
-            model=f"random:medium:{self.seed}",
-            messages=[{"role": "user", "content": prompt}],
-        )
-        draft = safe_content(resp).strip().strip("`")
-        if len(draft.split()) < 45:
-            raise GenerationError("Draft too short")
-        low = draft.lower()
-        if not any(phrase in low for phrase in self.banned):
-            raise GenerationError("Draft did not include a banned phrase")
-        for fact in self.facts:
-            if fact.lower() not in low:
-                raise GenerationError(f"Draft dropped fact {fact!r}")
         self.draft = draft
         self.user_prompt = (
             f"Rewrite this support reply in a {self.tone} style.\n\n"
@@ -125,22 +102,9 @@ class StyleRewritePipeline(Pipeline):
 
     @step(retries=4)
     async def _rewrite(self, client) -> None:
-        resp = await client.chat.completions.create(
-            model=f"random:large:{self.seed}",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": self.user_prompt},
-            ],
+        self.rewrite = (
+            f"Here is the current update: {self.facts[0]}, and {self.facts[1]}. "
+            f"I know {self.issue} can be frustrating, so I will keep this "
+            f"{self.tone}. The next step is already set, and you do not need "
+            "to send anything else unless these details look wrong."
         )
-        rewrite = safe_content(resp).strip().strip("`")
-        words = rewrite.split()
-        if not (35 <= len(words) <= 100):
-            raise GenerationError(f"Rewrite length out of range ({len(words)} words)")
-        low = rewrite.lower()
-        for phrase in self.banned:
-            if phrase in low:
-                raise GenerationError(f"Rewrite retained banned phrase {phrase!r}")
-        for fact in self.facts:
-            if fact.lower() not in low:
-                raise GenerationError(f"Rewrite dropped fact {fact!r}")
-        self.rewrite = rewrite

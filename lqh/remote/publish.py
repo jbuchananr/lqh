@@ -29,7 +29,7 @@ import tarfile
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 # Self-contained imports: pull only the artifacts module from lqh.
 # Avoid importing lqh.train so the remote venv doesn't need torch
@@ -117,6 +117,41 @@ def _load_lineage_sidecar(target: Path) -> dict | None:
         except (OSError, json.JSONDecodeError) as exc:
             logger.warning("failed to read %s: %s", cand, exc)
     return None
+
+
+def _adapter_base_model(target: Path) -> str | None:
+    """Return PEFT adapter base model if ``target`` is an adapter dir."""
+    cfg_path = target / "adapter_config.json"
+    if not cfg_path.exists() or not cfg_path.is_file():
+        return None
+    try:
+        cfg = json.loads(cfg_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("failed to read %s: %s", cfg_path, exc)
+        return None
+    base = cfg.get("base_model_name_or_path")
+    return base if isinstance(base, str) and base.strip() else None
+
+
+def _infer_checkpoint_lineage(c: _Candidate) -> dict[str, Any] | None:
+    """Infer lineage for adapter checkpoints when no sidecar was written.
+
+    This is a defense-in-depth path for older trainers or manual artifact
+    layouts that saved a LoRA adapter under ``model/`` instead of
+    ``model-lora/``. The adapter manifest is the authoritative local signal.
+    """
+    if c.kind != "checkpoint" or not c.path.is_dir():
+        return None
+    base_model = _adapter_base_model(c.path)
+    if base_model is None:
+        return None
+    return {
+        "artifact_kind": "checkpoint",
+        "training_method": "lora",
+        "base_model": base_model,
+        "hyperparams": {"lora_base": base_model},
+        "parent_ids": [],
+    }
 
 
 def _dir_has_weights(d: Path) -> bool:
@@ -348,6 +383,8 @@ def _resolve_candidates(run_dir: Path) -> list[_Candidate]:
     # on "what to publish" rather than "metadata to attach".
     for c in out:
         c.lineage = _load_lineage_sidecar(c.path)
+        if c.lineage is None:
+            c.lineage = _infer_checkpoint_lineage(c)
 
     return out
 

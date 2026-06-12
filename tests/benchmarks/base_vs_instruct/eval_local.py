@@ -71,6 +71,8 @@ async def _await_run(
             )
         await asyncio.sleep(poll)
         waited += poll
+    if manager.is_alive(run_dir):
+        manager.stop(run_dir)
     raise TimeoutError(f"{label} did not finish within {timeout:.0f}s ({run_dir})")
 
 
