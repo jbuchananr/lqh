@@ -1146,8 +1146,16 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
                 "fixed per project and chosen once via a system picker — do NOT ask the "
                 "user where to train and do NOT pass any compute/remote argument; just "
                 "call start_training and it routes automatically. "
-                "`eval_dataset` is REQUIRED (a small hyperparameter sweep runs "
-                "automatically and uses it as the held-out signal to pick the winner). "
+                "By default a small hyperparameter sweep runs (`enable_sweep=true`) — "
+                "the right choice for most users: on a new dataset you don't know how "
+                "this model size × dataset combination behaves, so several lr/epoch "
+                "configs train and the winner is picked on the held-out signal. Set "
+                "`enable_sweep=false` for a single run when the working hyperparameters "
+                "are already known from a previous sweep, when the user explicitly "
+                "specifies them, or for quick test/smoke runs — then set "
+                "`learning_rate` and `num_epochs` manually. "
+                "`eval_dataset` is REQUIRED either way (sweep winner selection and "
+                "judge scoring both need it). "
                 "You must also pass `scorer` — set to the project's default/best scorer — "
                 "so the best checkpoint gets a real judge score; the call is rejected "
                 "unless you pass `scorer` or set `disable_scoring=true` (only when the "
@@ -1240,14 +1248,40 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
                         ),
                         "default": True,
                     },
+                    "enable_sweep": {
+                        "type": "boolean",
+                        "description": (
+                            "Default true: train a small hyperparameter grid "
+                            "(SFT: lr ∈ {2e-5, 5e-5, 1e-4} × epochs ∈ {2, 3}) and keep "
+                            "the winner — use this whenever you don't yet know how this "
+                            "model size × dataset combination performs (i.e. most new "
+                            "datasets). Set false for a single training run when good "
+                            "hyperparameters are already known (e.g. from an earlier "
+                            "sweep on this dataset), when the user explicitly prescribes "
+                            "them, or for test/smoke runs where speed matters more than "
+                            "tuning. With false, set `learning_rate` and `num_epochs` "
+                            "yourself — reasonable SFT starting point: a medium lr of "
+                            "5e-5 and 2 epochs."
+                        ),
+                        "default": True,
+                    },
                     "num_epochs": {
                         "type": "integer",
-                        "description": "Number of training epochs (SFT only). Default: 3.",
+                        "description": (
+                            "Number of training epochs (SFT only). Only takes effect "
+                            "with `enable_sweep=false` (the sweep grid overrides it). "
+                            "Recommended single-run value: 2. Default: 3."
+                        ),
                         "default": 3,
                     },
                     "learning_rate": {
                         "type": "number",
-                        "description": "Learning rate. Default: 2e-5 for SFT, 5e-6 for DPO.",
+                        "description": (
+                            "Learning rate. Only takes effect with `enable_sweep=false` "
+                            "(the sweep grid overrides it). Recommended single-run "
+                            "value: 5e-5 (medium) for SFT; default if omitted: 2e-5 for "
+                            "SFT, 5e-6 for DPO."
+                        ),
                     },
                     "num_iterations": {
                         "type": "integer",
