@@ -121,7 +121,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--no-resume", action="store_true",
         help="recompute every stage even if outputs exist.",
     )
-    p.add_argument("--datagen-concurrency", type=int, default=20)
+    p.add_argument("--datagen-concurrency", type=int, default=100)
     p.add_argument("--max-new-tokens", type=int, default=512, help="eval generation cap")
     p.add_argument(
         "--sweep-timeout", type=float, default=48 * 3600,

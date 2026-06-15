@@ -328,7 +328,7 @@ async def run_scoring(
     client: AsyncOpenAI,
     *,
     model_size: str = "small",
-    concurrency: int = 20,
+    concurrency: int = 100,
     max_retries: int = 2,
     run_inference: bool = False,
     inference_model: str | None = None,
@@ -645,7 +645,7 @@ async def run_data_scoring(
     client: AsyncOpenAI,
     *,
     model_size: str = "small",
-    concurrency: int = 20,
+    concurrency: int = 100,
     on_progress: Callable[[int, int], Any] | None = None,
 ) -> ScoringResult:
     """Score data quality of a dataset (no inference, co-located output).
@@ -792,7 +792,7 @@ async def run_data_filter(
     *,
     threshold: float = 6.0,
     model_size: str = "small",
-    concurrency: int = 20,
+    concurrency: int = 100,
     max_retries: int = 2,
     on_progress: Callable[[int, int], Any] | None = None,
 ) -> FilterResult:

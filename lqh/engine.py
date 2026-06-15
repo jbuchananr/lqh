@@ -260,7 +260,7 @@ async def run_pipeline(
     client: AsyncOpenAI,
     *,
     max_retries: int = 3,
-    concurrency: int = 20,
+    concurrency: int = 100,
     samples_per_item: int = 1,
     validation_instructions: str | None = None,
     on_progress: Callable[[int, int], Any] | None = None,

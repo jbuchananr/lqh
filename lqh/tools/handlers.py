@@ -585,7 +585,7 @@ async def _execute_pipeline(
     from lqh.config import load_config
     from lqh.engine import run_pipeline
 
-    concurrency = min(20, num_samples)
+    concurrency = min(100, num_samples)
 
     # Signal start immediately
     if on_pipeline_progress:
@@ -994,7 +994,7 @@ async def handle_run_scoring(
 
     def _progress(completed: int, total: int) -> None:
         if on_progress:
-            on_progress(completed, total, min(20, total))
+            on_progress(completed, total, min(100, total))
 
     try:
         if mode == "data_quality":
@@ -4489,7 +4489,7 @@ async def handle_run_data_filter(
     def on_progress(completed: int, total: int) -> None:
         cb = kwargs.get("on_pipeline_progress")
         if cb:
-            cb(completed, total, 5)
+            cb(completed, total, min(100, total))
 
     try:
         result = await run_data_filter(
