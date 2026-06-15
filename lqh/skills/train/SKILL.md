@@ -4,6 +4,31 @@
 
 The training skill fine-tunes Liquid AI foundation models (LFMs) on your datasets using **supervised fine-tuning (SFT)** or **on-policy DPO** (direct preference optimization). Training runs as a background subprocess so you can continue chatting while it trains.
 
+## The default process (follow it; warn on skip)
+
+Unless the user directs otherwise, follow this order by default:
+
+1. **Confirm data + scorer quality first** — you have read the demo data and the
+   scorer's outputs yourself and both are good (else iterate in `/datagen`).
+2. **Filter** the training and eval data with the scorer (never train on raw data).
+3. **Build + filter a held-out eval (validation) set** (a few hundred samples) that
+   is used only for evaluation, never for training.
+4. **Zero-shot baseline eval** of the base model on the eval set — **with a
+   well-structured system prompt** (see below). This is your comparison point.
+5. **Pilot SFT** on a small training set (a few hundred–low thousands) at **default
+   hyperparameters, no sweep**, just to confirm the direction is right.
+6. **Evaluate the pilot** vs baseline, then decide: improvement → scale; degradation
+   → sweep, else improve data/scorer; unchanged → scale with caution.
+7. **Scaled SFT** (tens of thousands of samples) **with the hyperparameter sweep**.
+8. **Evaluate + score** the best SFT checkpoint; scale further or fix data as the
+   trajectory dictates.
+9. **DPO** only once SFT is stuck/plateaued (or high average with outlier failures):
+   base = best SFT checkpoint, **sweep directly**. Then compare best DPO vs best SFT
+   vs baseline.
+
+If the user explicitly asks to skip a step or jump ahead, do so — but **warn in one
+sentence** that it deviates from the ideal process and may give suboptimal results.
+
 ## Requirements
 
 Install the optional training dependencies:
@@ -19,13 +44,13 @@ This installs `torch`, `transformers`, `trl`, and `peft`. If unavailable, traini
 Unless the user explicitly requests a different approach, follow this three-phase strategy:
 
 ### Phase 1: Validate (Pilot SFT)
-Run a small SFT training run with 200-500 samples to confirm the data produces measurable improvement. This is fast (under a minute on a single GPU) and catches data quality issues early. If the pilot shows no improvement, fix the data or pipeline before investing more compute.
+Run a small SFT training run with 200-500 samples to confirm the data produces measurable improvement. **Run the pilot at default hyperparameters with `enable_sweep=false` — no sweep at this stage.** Its only job is to check the direction is right, and a sweep would pay 2-3x cost for a signal you don't need yet. This is fast (under a minute on a single GPU) and catches data quality issues early. If the pilot shows no improvement, fix the data or pipeline before investing more compute. (Don't conclude too much from a few-hundred-sample pilot either — see the decision tree below.)
 
 ### Phase 2: Scale (Larger SFT)
-Once the pilot confirms improvement, scale up the training dataset to thousands of samples and run SFT again. More data generally means better results — if scaling continues to improve scores, keep generating more data. Run multiple iterations if needed: generate more data → train → evaluate → repeat.
+Once the pilot confirms improvement, scale up the training dataset to **thousands → tens of thousands** of samples and run SFT again — **this time with the hyperparameter sweep on (the default)**. More data generally means better results — if scaling continues to improve scores, keep generating more data. Run multiple iterations if needed: generate more data → train → evaluate → repeat. Expect to need at least a few thousand high-quality samples before a meaningful gain appears.
 
 ### Phase 3: Polish (On-Policy DPO)
-DPO is best suited for **fixing specific failure modes** — when the model scores well on average but has a few consistent failure cases that need correction. DPO is ~100x slower than SFT and gains are smaller, so only use it after SFT has plateaued. Use a small dataset (200-500 samples) and few iterations (2-3). Watch for overfitting: if iteration scores improve during training but the final post-training eval drops, reduce the number of iterations.
+DPO is best suited for **fixing specific failure modes** — when the model scores well on average but has a few consistent failure cases that need correction. DPO is ~100x slower than SFT and gains are smaller, so only use it after SFT has plateaued or is stuck. The **base model for DPO is your best SFT checkpoint**, and because DPO is very hyperparameter-sensitive (and you already have a large SFT dataset by this point) it **sweeps directly — no default-hyperparameter first run, unlike the SFT pilot**. Use a small dataset (200-500 samples) and few iterations (2-3). Watch for overfitting: if iteration scores improve during training but the final post-training eval drops, reduce the number of iterations. Finally, compare best DPO vs best SFT vs baseline.
 
 **Important:** If the user explicitly requests DPO from the start, or wants to skip SFT, follow their instructions. The above is the default recommendation, not a hard rule.
 
@@ -47,30 +72,79 @@ These are starting points to judge a checkpoint. They are not hard rules
   if iteration N+1 scores below iteration N, the previous checkpoint is
   the keeper and further iterations will likely hurt.
 
+## After evaluating a checkpoint — decide the next move
+
+Every checkpoint score is read **relative to the baseline** (and to the previous
+run). Based on the comparison:
+
+- **Improvement / right direction** → **scale the dataset** (pilot's low thousands
+  → tens of thousands) and train again. After the scaled run, if it keeps
+  improving, scale further; this is the main lever.
+- **Degradation** → first **run the hyperparameter sweep** (if this was the
+  default-config pilot, the scaled run already sweeps; for a swept run, the sweep
+  has already tried the grid). If tuning still doesn't recover it, the bottleneck
+  is **data + scorer quality** — go back to `/datagen`, improve the pipeline and
+  scorer, re-filter, and retrain. Don't keep retraining the same bad data.
+- **Unchanged (flat vs baseline)** → you *may* scale, but **with caution**: a flat
+  result can signal under-fitting (too little data/too few epochs — scaling helps)
+  or over-fitting / a data ceiling (scaling won't help). Look at train vs eval loss
+  and the score distribution before committing more compute.
+
+**Don't over- or under-react to the pilot.** A few-hundred-sample pilot gives a
+*direction*, not a final verdict — you typically need at least a few thousand
+high-quality samples before a real gain appears. Equally, don't jump straight from
+a tiny pilot to a 20k run without reading the pilot signal first.
+
 ## Workflow
 
 ### 1. Pre-requisites
 
 Before training, you should have:
+- **Confirmed data + scorer quality yourself.** Before *any* training run, you must
+  have read the demo/example samples AND the scorer's outputs (the `scores.parquet`
+  reasoning + scores) with your own eyes and judged both to be good. Training on
+  data or a scorer you have not inspected is the #1 way to waste compute. If either
+  is poor, go back to the `data_generation` skill and iterate (its Phase 2 Steps
+  2.4–2.5 cover testing and fixing the scorer) — do not train to "see what happens".
 - A **SPEC.md** defining the task
-- A **training dataset** in `datasets/<name>/data.parquet` (ChatML format)
-- An **eval dataset** in `datasets/<name>_eval/data.parquet`
 - A **scorer** in `evals/scorers/<name>.md`
+- A **filtered training dataset** in `datasets/<name>_train_filtered/data.parquet`
+  (ChatML format). **Pipeline-generated data must be passed through
+  `run_data_filter` with the scorer before training — never train on the raw
+  generated set.** Filtering is skipped only when the data is human-curated.
+- A **filtered eval dataset** in `datasets/<name>_eval_filtered/data.parquet`
+  (same rule; skip filtering only for a human-curated eval set)
 - A **baseline eval** run to compare against (via `run_scoring` with `mode=model_eval`)
+
+If only raw generated datasets exist, filter them first (see the
+`data_generation` skill, Phase 3.5):
+```
+run_data_filter(
+    input_path="datasets/<name>_train/data.parquet",
+    scorer_path="evals/scorers/<name>.md",
+    output_dataset="<name>_train_filtered",
+    threshold=7.0,
+    model_size="small",   # the judge size validated during data gen
+)
+```
 
 ### 2. Start SFT Training
 
-Use the `start_training` tool:
+Use the `start_training` tool. The **pilot** runs at default hyperparameters with
+`enable_sweep=false`:
 
 ```
 start_training(
     type="sft",
     base_model="LiquidAI/LFM2.5-1.2B-Instruct",
-    dataset="datasets/summarization_v1",
-    eval_dataset="datasets/summarization_v1_eval",
+    dataset="datasets/summarization_v1_train_filtered",
+    eval_dataset="datasets/summarization_v1_eval_filtered",
     scorer="evals/scorers/summarization_v1.md",
+    enable_sweep=false,   # pilot: validate direction at default hyperparameters
 )
 ```
+
+For the **scaled** SFT run (Phase 2), drop `enable_sweep=false` so the sweep runs.
 
 This:
 1. Writes `config.json` to `runs/<run_name>/`
@@ -94,7 +168,7 @@ After training completes, the final model is saved to `runs/<run_name>/model/`. 
 ```
 start_local_eval(
     model_path="runs/sft_001/model",
-    dataset="datasets/summarization_v1_eval",
+    dataset="datasets/summarization_v1_eval_filtered",
     scorer="evals/scorers/summarization_v1.md",
 )
 ```
@@ -109,8 +183,8 @@ If SFT alone isn't enough, run on-policy DPO to further improve the model:
 start_training(
     type="on_policy_dpo",
     base_model="runs/sft_001/model",
-    dataset="datasets/summarization_v1",
-    eval_dataset="datasets/summarization_v1_eval",
+    dataset="datasets/summarization_v1_train_filtered",
+    eval_dataset="datasets/summarization_v1_eval_filtered",
     scorer="evals/scorers/summarization_v1.md",
     golden_source="api",
 )
@@ -155,9 +229,13 @@ After setup, the next `start_training` offers the new remote in the picker. The 
 
 ## Training Configuration
 
-### Hyperparameter sweeping is the default
+### Hyperparameter sweeping (default for scaled SFT and DPO; OFF for the pilot)
 
-When you call `start_training` (SFT or DPO), the harness **automatically sweeps a small grid of hyperparameters** and picks the best config using a cheap in-training proxy. You do not need to (and should not) pick `learning_rate` / `num_epochs` / `dpo_beta` values yourself, and you should NOT ask the user to confirm that you can sweep — sweeping is the default for a reason and the user expects it.
+When you call `start_training`, the harness **automatically sweeps a small grid of hyperparameters** and picks the best config using a cheap in-training proxy. This is the default for the **scaled SFT run (Phase 2)** and for **all DPO runs (Phase 3)** — you do not pick `learning_rate` / `num_epochs` / `dpo_beta` yourself, and you should NOT ask the user to confirm sweeping.
+
+**The one exception is the pilot SFT (Phase 1): run it with `enable_sweep=false` at default hyperparameters.** The pilot only needs to confirm direction, so paying the 2-3x sweep cost there is wasteful. Sweep once you scale.
+
+In all cases, **do not ask the user about hyperparameters** — follow this ideal setup (pilot off, scale/DPO on) automatically unless they explicitly instruct otherwise.
 
 **Default grids** (6 configs each):
 - SFT: `lr ∈ {2e-5, 5e-5, 1e-4} × epochs ∈ {2, 3}`
@@ -183,9 +261,13 @@ So we sweep training cheaply, pick a winner using an in-training proxy that cost
 
   Chosen-CE is hack-resistant because the *reference* model is frozen, so the only way to make `delta_ref` look good is to actually raise `P(chosen)` — which is what we care about.
 
-### When to opt out
+### When `enable_sweep=false` applies
 
-Pass `enable_sweep=false` only if the user explicitly asks: "don't tune, just run with these hyperparameters", "skip the sweep", "I want a single run", etc. Under `enable_sweep=false`, the agent's `learning_rate` / `num_epochs` / `dpo_beta` arguments are honoured directly.
+Two cases: (1) **the pilot SFT**, where it is the default (validate direction at
+default hyperparameters), and (2) when the user explicitly opts out of the sweep
+for a scaled/DPO run: "don't tune, just run with these hyperparameters", "skip the
+sweep", "I want a single run", etc. Under `enable_sweep=false`, the agent's
+`learning_rate` / `num_epochs` / `dpo_beta` arguments are honoured directly.
 
 ### Optional knobs (single-config path only)
 
@@ -247,22 +329,46 @@ Single-config runs (`enable_sweep=false`) skip the sweep wrapper and use the sam
 
 When helping the user with training:
 
-1. **Always run a baseline eval first** — before training, run `run_scoring` with `mode=model_eval` on the base model to establish a score baseline.
+1. **Always run a baseline eval first — with a well-structured system prompt.**
+   Before training, run `run_scoring` with `mode=model_eval` on the base model to
+   establish a score baseline. **VERY IMPORTANT: always pass a system prompt for
+   this baseline.** A small base model with no system prompt does not know what the
+   task is, produces confused output, and scores near zero — a meaningless baseline
+   that then makes any trained model look falsely amazing. Forgetting the system
+   prompt here is one of the most common and most damaging mistakes. The system
+   prompt should be **well-structured**: clear task instructions, the expected
+   output format, and ideally one or two short examples. Pass
+   `system_prompt_path="prompts/{task}_v0.md"` if it exists; otherwise derive a
+   minimal-but-complete prompt from `SPEC.md`, write it to `prompts/{task}_v0.md`,
+   and pass it. A true no-prompt run is only a lower-bound sanity check, never the
+   headline baseline. (See the `evaluation` skill's "System prompts for baseline
+   eval" for the same rule.)
 
 2. **Always pass `eval_dataset` and a `scorer`** — `eval_dataset` is required (the run is rejected without it). Set `scorer` to the project's default/best scorer (the one under `evals/scorers/` used for the baseline eval) so the run produces a real judge score, not just the internal proxy. The run is rejected unless you pass `scorer` or set `disable_scoring=true` — **set `disable_scoring=true` only when the user explicitly asks not to score** ("don't score it", "skip the eval"). See *`eval_dataset` is required; scoring is on by default*.
 
 3. **Fetch the judge score after the run** — a finished run does not push the score into your context. Once the run is terminal (including on reconnect after a closed laptop), call `training_status(run_name=...)` and read the eval-of-best judge score from the run artifacts (`eval_result.json` / `sweep_summary.json` `eval_of_best`), then report **judge score vs. baseline**. See *Fetch the judge score after the run*.
 
-4. **Do NOT ask the user whether to hyperparameter-tune.** Sweeping is the default and the user expects it. Just kick off the run. If sweeping will surprise the user (e.g. they expected a fast single-config run), inform them in one sentence after starting: *"I'm running a 6-config sweep — this will pick the best hyperparameters automatically. Use `enable_sweep=false` next time if you'd prefer a single config."* Do **not** gate the run on confirmation.
+4. **Do NOT ask the user whether to hyperparameter-tune.** Follow the default
+   automatically: **pilot SFT off (`enable_sweep=false`), scaled SFT and DPO on.**
+   Just kick off the run. When the scaled/DPO sweep might surprise the user, inform
+   them in one sentence after starting: *"I'm running a 6-config sweep — this will
+   pick the best hyperparameters automatically."* Do **not** gate the run on
+   confirmation.
 
-5. **Only pass `enable_sweep=false` when the user explicitly opts out.** Phrases that count as opt-out: "don't tune", "skip the sweep", "just one run", "use these hyperparameters", or any concrete `learning_rate=…` value attached to "just this once". When `enable_sweep=false`, you may pass specific `learning_rate` / `num_epochs` / `dpo_beta` values.
+5. **Sweep on/off follows the stage by default — the user can override either way.**
+   The pilot uses `enable_sweep=false`; the scaled SFT run and DPO sweep. Honor an
+   explicit override: "don't tune" / "skip the sweep" / "just one run" / a concrete
+   `learning_rate=…` "just this once" → `enable_sweep=false` (and you may then pass
+   specific `learning_rate` / `num_epochs` / `dpo_beta`); "tune the pilot too" →
+   sweep the pilot.
 
 6. **Follow the validate → scale → polish strategy** — unless the user explicitly requests otherwise:
-   - Start with a pilot SFT run (200-500 samples) to confirm improvement.
-   - Scale up the dataset and run SFT again if the pilot succeeds.
-   - Only suggest DPO after SFT has plateaued, and frame it as polishing specific failure cases.
+   - Start with a pilot SFT run (200-500 samples, `enable_sweep=false`, default hyperparameters) to confirm improvement.
+   - If the pilot succeeds, scale up the dataset (toward tens of thousands) and run SFT again **with the sweep on**.
+   - Only suggest DPO after SFT has plateaued/is stuck; base it on the best SFT checkpoint, sweep it directly, and frame it as polishing specific failure cases.
+   - Use the "After evaluating a checkpoint" decision tree to choose scale vs. tune vs. fix-data at each step.
 
-7. **Check dataset quality** — before training, verify the training data quality with `run_scoring` in `data_quality` mode. Low-quality training data = low-quality fine-tuned model.
+7. **Filter the data before training** — pipeline-generated training (and eval) data must be passed through `run_data_filter` with the scorer before it is used, and training must point at the `*_filtered` dataset. Filtering both checks quality and removes the low-scoring tail; low-quality training data = low-quality fine-tuned model. Skip only for human-curated data or when the user explicitly opts out.
 
 8. **Use `training_status` proactively** — after starting a run, periodically check status. The sweep table in `training_status` shows per-config results with the validated proxy (`eval_loss` for SFT, `eval_ce_chosen_mean` for DPO). It is intentional that DPO `eval_loss` and `eval_rewards/margins` are NOT shown — those metrics would mislead you (they can look great when the model has actually collapsed). Trust the sweep's chosen winner.
 
@@ -275,4 +381,32 @@ When helping the user with training:
 
 10. **Handle errors gracefully** — if training fails (CUDA OOM, etc.), read `stderr.log` (or `sweep_<config>/stderr.log` for a specific config) and suggest fixes (lower batch size, enable gradient checkpointing, etc.).
 
-11. **Respect user preferences** — if the user wants to start with DPO, skip the pilot, or use a different strategy, follow their instructions. The validate → scale → polish strategy is a default recommendation, not a requirement.
+11. **Respect user preferences** — if the user wants to start with DPO, skip the pilot, or use a different strategy, follow their instructions (with a one-sentence warning that it deviates from the ideal process). The validate → scale → polish strategy is a default recommendation, not a requirement.
+
+## Common Failure Modes and Issues
+
+Watch for these — they are the recurring ways a training effort goes wrong:
+
+- **Training before inspecting data + scorer quality.** Kicking off SFT without
+  having read the demo samples and the scorer's outputs yourself leads to poor
+  models and wasted compute. Confirm both are good first (see Pre-requisites).
+- **Forgetting the system prompt in the zero-shot baseline.** A base model with no
+  system prompt is confused and scores near zero — a meaningless baseline that
+  makes later runs look falsely great and hides real improvement. Always pass a
+  well-structured system prompt (instructions + output format + ideally examples).
+- **Staying at a tiny dataset, or scaling blindly.** Both extremes fail: a
+  few-hundred-sample run is only a direction check (expect a real gain only past a
+  few thousand high-quality samples), but jumping straight to 20k without reading
+  the pilot signal wastes compute on an unvalidated direction.
+- **Training on raw, unfiltered data.** Always filter the training and eval sets
+  with the scorer first; the low-scoring tail teaches the model the wrong thing.
+- **Skipping hyperparameter tuning at scale.** The pilot is fine at defaults, but
+  the scaled SFT and DPO runs should sweep — leaving them unswept commonly leaves
+  a real improvement on the table.
+- **Jumping straight to DPO.** DPO is a polish step. Reaching for it before a
+  thorough SFT (filtered data → scale → sweep) usually disappoints; DPO's gains are
+  small and it is hyperparameter-sensitive.
+- **Base model too small for the task.** A 350M model cannot learn a task that
+  genuinely needs a model orders of magnitude larger, no matter how good the data.
+  If a model scores poorly even after training on a large, high-quality, filtered
+  dataset, try a **larger base model** before assuming the data is the problem.

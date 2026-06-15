@@ -63,7 +63,19 @@ Load the `data_generation` skill. Build a data-generation pipeline in
 `data_gen/<task>_v1.py`. Run it with **3, 5, or 10 samples** for syntax
 and quality validation. Read the resulting parquet back. If samples are
 broken or off-spec, fix the pipeline and retry. Iterate until samples are
-satisfactory — you are the only reviewer.
+satisfactory — you are the only reviewer. When breakdown into smaller steps
+stops helping or outputs look hallucinated, escalate the weak generator step
+`random:small → medium → large`.
+
+**Then validate the Stage-1 rubric on these draft samples before you ever
+filter with it.** Run `run_scoring(dataset="datasets/<draft>", scorer="evals/scorers/<task>.md", mode="data_quality", model_size="small")`
+and read `scores.parquet`: confirm the rubric scores the drafts *you* judged
+good as high and any weak ones as low, for the right reason. A rubric that
+flat-scores everything or rewards the wrong thing is not ready. If it
+mis-ranks, revise `evals/scorers/<task>.md` (sharpen the rubric, add good /
+bad / mid examples) and/or escalate `model_size` small→medium→large, then
+re-check — before it is used to filter in Stage 4. Carry the validated
+`model_size` forward to Stage 4.
 
 ### Stage 3 — `data_gen_validation`
 Scale the same pipeline to a **validation set** (typically 100–500
@@ -73,11 +85,19 @@ samples; larger if the task is high-noise).
 Load the `data_filtering` skill. Run scoring + the data filter on the
 validation set with the rubric from Stage 1.
 
+Use the `model_size` you validated in Stage 2 for both the scoring and the
+filter, not the silent default.
+
 **Soft threshold:** keeping ≥70% of samples is healthy. If the filter
 discards more than ~30% (i.e. fewer than 70% kept), this is a red flag —
 prefer scaling up the data-generation model (use a larger generator) over
 loosening the rubric. Surface the warning via `set_auto_stage` note. Do
 not loosen the rubric just to pass; that defeats the point.
+
+**If the filter results themselves look mis-ranked** — high-quality samples
+dropped or obvious junk kept — the judge, not the threshold, is the problem.
+Escalate `model_size` small→medium→large and re-run before touching the
+threshold.
 
 ### Stage 5 — `baseline_eval`
 Load the `evaluation` skill. Run a zero-shot evaluation of the base model

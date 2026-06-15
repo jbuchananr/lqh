@@ -28,6 +28,7 @@ Strips the final assistant turn(s) from labelled eval samples, runs model infere
 ## Rules
 
 1. **Check prerequisites first.** Use `summary` to verify an eval dataset (with `_eval` suffix) and a scorer exist. If not, suggest `/datagen`.
+   - **Evaluate on the FILTERED eval set.** A pipeline-generated eval set must be passed through `run_data_filter` (with the scorer) before you benchmark on it — otherwise baselines are measured against noise the pipeline let through. Prefer the `*_eval_filtered` dataset. If only a raw generated `*_eval` set exists, filter it first (`run_data_filter(input_path="datasets/{task}_eval/data.parquet", scorer_path="evals/scorers/{task}_v1.md", output_dataset="{task}_eval_filtered", threshold=7.0, model_size=...)`), then evaluate on the result. Skip filtering only when the eval set is human-curated.
 2. **Test multiple models.** Use `list_models` to see available LFMs, then run at least 2-3 different models for comparison.
 3. **Use descriptive run names.** E.g., `baseline_lfm2.5_1.2b`, `baseline_small`, `baseline_medium`.
 4. **After scoring, show results.** Use `read_file` on each `evals/runs/*/summary.json` and present a comparison table.
@@ -37,7 +38,7 @@ Strips the final assistant turn(s) from labelled eval samples, runs model infere
 ### Step 1: Check Prerequisites
 
 Use `summary` to verify:
-- An eval dataset exists (e.g., `datasets/{task}_eval/data.parquet`)
+- A **filtered** eval dataset exists (e.g., `datasets/{task}_eval_filtered/data.parquet`). If only a raw `datasets/{task}_eval` exists, filter it first per Rule 1 (unless it is human-curated).
 - A scorer exists (e.g., `evals/scorers/{task}_v1.md`)
 
 If either is missing, tell the user and suggest running `/datagen` first.
@@ -52,7 +53,7 @@ Run model evaluation on 2-4 models. Start with a small model and work up:
 
 ```
 run_scoring(
-    dataset="datasets/{task}_eval",
+    dataset="datasets/{task}_eval_filtered",   # filtered eval set, not the raw generated one
     scorer="evals/scorers/{task}_v1.md",
     mode="model_eval",
     run_name="baseline_{model_id}",

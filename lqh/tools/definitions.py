@@ -423,7 +423,10 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
                             "'data_quality' scores the dataset's existing assistant turns "
                             "and writes scores.parquet next to data.parquet. "
                             "'model_eval' strips assistant turns, runs inference, scores "
-                            "the model outputs, and writes to evals/runs/<run_name>/."
+                            "the model outputs, and writes to evals/runs/<run_name>/. "
+                            "For model_eval of a base/zero-shot model, ALWAYS supply a "
+                            "system prompt (system_prompt_path or inference_system_prompt); "
+                            "without one a base model is confused and scores near zero."
                         ),
                     },
                     "run_name": {
@@ -458,7 +461,11 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
                         "description": (
                             "System prompt to prepend to each sample before running "
                             "inference. Used in mode='model_eval' to test different "
-                            "prompt strategies with the same model and eval dataset."
+                            "prompt strategies with the same model and eval dataset. "
+                            "Always set this (or system_prompt_path) for a base-model "
+                            "baseline — a well-structured prompt with task instructions "
+                            "and expected output format; without one the baseline is "
+                            "a confused, near-zero score."
                         ),
                     },
                     "system_prompt_path": {

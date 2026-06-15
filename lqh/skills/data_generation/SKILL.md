@@ -2,8 +2,16 @@
 
 You are now in **data generation** mode. This skill covers three phases:
 1. **Draft iteration** — Build a pipeline, generate ~20 draft samples, iterate with the user
-2. **Judge/scorer creation** — While user feedback is fresh, create evaluation criteria
+2. **Judge/scorer creation AND validation** — While user feedback is fresh, create evaluation criteria, then *test the scorer on the approved draft samples* before trusting it
 3. **Validation set** — Generate a larger eval dataset and auto-score it
+
+The typical sequence is: (1) get the pipeline working (syntax/import/format),
+(2) inspect the generated data *yourself*, (3) improve the pipeline by breaking
+generation into smaller steps, (4) escalate the generator model if needed, (5)
+create a scorer from the same spec/rubrics, (6) test the scorer on the demo
+samples, (7) iterate the scorer prompt if it under-performs, (8) escalate the
+judge model if needed. Data generation **includes** the scorer and verifying
+that the scorer actually works — it is not done when the samples look good.
 
 ## Overview
 
@@ -641,11 +649,18 @@ Run `run_data_gen_pipeline` with `num_samples=1`. If it fails, fix the pipeline 
 
 #### Step 1.4: Generate Draft Set (~20 samples)
 
-Run with `num_samples=20` and output to `datasets/{name}_draft/`.
+Run with `num_samples=20` and output to `datasets/{task}_draft/` (Step 2.4 scores this same dataset).
 
-#### Step 1.5: Show Drafts to User
+#### Step 1.5: Inspect the Drafts Yourself, Then Show the User
 
-Use `show_file` on the draft parquet to let the user browse samples, then `ask_user`:
+**Inspect first.** Before involving the user, `read_file` the draft parquet and
+judge the samples *yourself* against `SPEC.md`: are the inputs diverse, the
+outputs on-format, the content accurate and free of hallucination? If they fall
+short of the spec, do **not** show them yet — go to Step 1.6 and iterate. Showing
+the user a batch you already know is weak wastes their time. Only surface drafts
+once you believe they are good.
+
+Then use `show_file` on the draft parquet to let the user browse samples, and `ask_user`:
 
 ```
 ask_user(
@@ -664,7 +679,23 @@ ask_user(
 - If the user reports issues: fix the pipeline, regenerate drafts, show again
 - If the user wants spec changes: update `SPEC.md` with `edit_file`, then regenerate
 - **Keep iterating until the user approves the draft quality**
-- Each iteration: fix → regenerate → show → ask
+- Each iteration: inspect → fix → regenerate → inspect → show → ask
+
+**The first iteration lever is to break the sample down into smaller, easier
+steps.** A weak one-shot generation almost always improves when you decompose it:
+generate a multi-turn conversation turn-by-turn (separate calls) instead of in one
+shot; generate each output of a multi-output sample separately; generate each
+case/class of a multi-case sample with its own controlled prompt; produce
+intermediate artifacts (a document, then its extraction) rather than the final
+answer directly. Small steps that combine into a strong sample beat one big prompt.
+
+**Escalate the generator model only after breakdown stops helping.** If several
+iterations of breaking the sample down do not fix quality — or if the outputs look
+**hallucinated or off-spec** regardless of prompt wording — move the weak step(s)
+from `random:small` → `random:medium` → `random:large` and regenerate. Escalate
+the specific step that is failing, not the whole pipeline. (This is the
+"uniformly mediocre" case in Phase 3.5.3 — when even the best samples are only
+OK, a stronger generator helps more than any threshold or prompt tweak.)
 
 ### Phase 2: Judge/Scorer Creation
 
@@ -745,6 +776,50 @@ Example for a translation task:
 
 The schema is auto-discovered at eval time: when `system_prompt_path="prompts/translation_v0.md"` is used, the system looks for `prompts/translation.schema.json` in the same directory. Only create this for tasks with structured output — free-form text tasks don't need it.
 
+#### Step 2.4: Test the Scorer on the Draft Samples
+
+**Do not trust the scorer until you have seen it score real samples.** Creating a
+scorer is not the same as having a working scorer — verifying it is part of this
+phase. Run it on the ~20 draft samples you and the user already approved in
+Phase 1 (reuse that dataset — no need to regenerate):
+
+```
+run_scoring(
+    dataset="datasets/{task}_draft",
+    scorer="evals/scorers/{task}_v1.md",
+    mode="data_quality",
+    model_size="small"
+)
+```
+
+Then **inspect `scores.parquet` yourself**: read the per-sample `score` and
+`reasoning` and check them against your own and the user's judgment of those same
+samples. The samples you both considered good should score high; any you flagged
+as weak should score low, for the *right* reason stated in the reasoning. A scorer
+that gives everything a flat 8, or rewards the wrong thing, is not working yet.
+
+Optionally `show_file` the scores to the user to confirm the scorer matches their
+expectations before you rely on it downstream.
+
+#### Step 2.5: Iterate the Scorer / Escalate the Judge
+
+If the scorer mis-scores the draft (as judged by you or the user), fix it before
+moving on — a broken scorer poisons every later filter and eval.
+
+1. **Iterate the prompt/spec first.** Sharpen the rubric wording, tighten the
+   critical-failure conditions, and — the highest-leverage change — add **concrete
+   examples covering the full spectrum: good, bad, AND mid**. One example in each
+   direction anchors the judge far better than instructions alone; the mid example
+   is what stops the judge collapsing everything to the extremes. Encode the
+   specific failure mode you observed in Step 2.4 as one of the examples.
+2. **Re-run Step 2.4 and re-inspect.** Confirm the scores now track the samples.
+3. **Escalate the judge model only after prompt iteration stops helping.** If
+   after several prompt revisions the judge still mis-ranks samples, move the judge
+   up a size: pass `model_size="medium"` (then `"large"`) to `run_scoring` and
+   re-test. Once a size works, **reuse that same `model_size` downstream** — in the
+   Phase 3 validation scoring and the Phase 3.5 training-set filter — so the
+   validated judge is the one actually used.
+
 ### Phase 3: Validation Set Generation
 
 #### Step 3.1: Suggest Validation Set Size
@@ -780,7 +855,8 @@ Run data quality scoring on the validation set:
 run_scoring(
     dataset="datasets/{task}_eval",
     scorer="evals/scorers/{task}_v1.md",
-    mode="data_quality"
+    mode="data_quality",
+    model_size="small"   # use the size you validated in Step 2.5, not the default
 )
 ```
 
@@ -790,11 +866,18 @@ Show the scoring results to the user with `show_file` on the scores.parquet.
 
 Present a summary: total samples, mean/median score, any issues found. Then offer next steps.
 
-### Phase 3.5: Filter Before Training (Default-On)
+### Phase 3.5: Filter Before Evaluation or Training (Default-On)
 
-**Rule: always filter the training set with `run_data_filter` before SFT or
-DPO unless the user explicitly opts out.** Do not hand a raw generated dataset
-to training.
+**Rule: any pipeline-generated dataset must be filtered with `run_data_filter`
+(using the scorer from Phase 2) before it is used — for evaluation OR for SFT/DPO
+— unless the user explicitly opts out.** Generated data is never used raw. This
+applies to both streams:
+
+- **Training set** → filter before SFT/DPO. Hand training only the filtered set.
+- **Validation / eval set** → filter before running baselines or model eval, so
+  the scores reflect the task and not noise the pipeline let through. (Skip only
+  when the eval set is human-curated rather than pipeline-generated — a hand-built
+  eval set is already trusted.)
 
 This is not optional polish — it is a load-bearing sanity check. Here's why:
 
@@ -817,6 +900,7 @@ run_data_filter(
     scorer_path="evals/scorers/{task}_v1.md",
     output_dataset="{task}_train_filtered",
     threshold=7.0,            # 7.0 is the default starting point; adjust per task
+    model_size="small",       # reuse the judge size you validated in Step 2.5
 )
 ```
 
@@ -834,6 +918,7 @@ run_data_filter(
     scorer_path="evals/scorers/{task}_v1.md",
     output_dataset="{task}_eval_filtered",
     threshold=7.0,
+    model_size="small",       # reuse the judge size you validated in Step 2.5
 )
 ```
 

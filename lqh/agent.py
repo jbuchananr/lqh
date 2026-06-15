@@ -192,7 +192,10 @@ Scoring and evaluation artifacts:
 Data quality scores are co-located with datasets: datasets/{name}/scores.parquet.
 
 To score data quality: create a scorer .md file, then use run_scoring with mode='data_quality'. \
-To evaluate a model: use run_scoring with mode='model_eval', a run_name, and system_prompt_path.\
+To evaluate a model: use run_scoring with mode='model_eval', a run_name, and system_prompt_path. \
+IMPORTANT: when evaluating a base/zero-shot model, ALWAYS pass a well-structured system \
+prompt (task instructions + expected output format); without one the base model is confused \
+and scores near zero, giving a misleading baseline.\
 """
 
 MAX_CONTEXT_TOKENS = 200_000
