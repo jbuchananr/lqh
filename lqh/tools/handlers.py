@@ -77,6 +77,75 @@ def _validate_path(project_dir: Path, rel_path: str) -> Path:
     return resolved
 
 
+def _resolve_training_sources(
+    project_dir: Path,
+    spec: "str | list[Any]",
+    *,
+    kind: str,
+    allow_repeat: bool,
+) -> "tuple[list[dict[str, Any]], list[Path], str | None]":
+    """Validate one or more dataset sources and resolve them to canonical
+    config entries.
+
+    *spec* is the agent-facing form: a single dataset-DIRECTORY path, a list
+    of such paths, or (train only) a list of ``{"path", "repeat"}`` objects.
+    Each directory must contain ``data.parquet``.
+
+    Returns ``(entries, resolved_parquet_paths, error)``. On the first failure
+    *error* is a human-readable string and the other two values are empty.
+    Each entry is ``{"path": <project-rel data.parquet>, "repeat": int,
+    "source": <label>}`` (``repeat`` omitted when *allow_repeat* is False).
+    """
+    from lqh.train.data_utils import normalize_sources
+
+    try:
+        raw = normalize_sources(spec, allow_repeat=allow_repeat)
+    except ValueError as exc:
+        return [], [], f"Error: invalid {kind}: {exc}"
+
+    entries: list[dict[str, Any]] = []
+    resolved: list[Path] = []
+    project_resolved = project_dir.resolve()
+    for i, src in enumerate(raw, start=1):
+        try:
+            ds_path = _validate_path(project_dir, src["path"])
+        except ValueError as exc:
+            return [], [], f"Error: {kind} source {i}: {exc}"
+        data_parquet = ds_path / "data.parquet"
+        if not data_parquet.exists():
+            return [], [], (
+                f"Error: {kind} source {i} not found at {src['path']}/data.parquet"
+            )
+        rel = data_parquet.relative_to(project_resolved).as_posix()
+        entry: dict[str, Any] = {"path": rel}
+        if allow_repeat:
+            entry["repeat"] = src["repeat"]
+        entries.append(entry)
+        resolved.append(data_parquet.resolve())
+
+    # Derive stable, disambiguated source labels from the resolved parquet
+    # paths (parent dir name) — reuse normalize_sources' labelling so it
+    # matches what load_eval_sources/load_chatml_datasets derive downstream.
+    labels = normalize_sources([e["path"] for e in entries], allow_repeat=False)
+    for entry, lab in zip(entries, labels):
+        entry["source"] = lab["source"]
+
+    return entries, resolved, None
+
+
+def _sources_to_config(entries: "list[dict[str, Any]]") -> "str | list[dict[str, Any]]":
+    """Canonical config value for a resolved source list.
+
+    A single source with no over-sampling collapses to a bare path string —
+    byte-for-byte the legacy single-dataset config shape, so existing configs,
+    bundles, and downstream readers are unaffected. Multi-source (or a
+    ``repeat`` > 1) keeps the full list of ``{"path", ...}`` entries.
+    """
+    if len(entries) == 1 and entries[0].get("repeat", 1) == 1:
+        return entries[0]["path"]
+    return entries
+
+
 def _truncate_content(content: str, offset: int = 0) -> tuple[str, bool]:
     """Truncate content if it exceeds the threshold."""
     lines = content.split("\n")
@@ -2513,8 +2582,8 @@ async def handle_start_training(
     *,
     type: str,
     base_model: str,
-    dataset: str,
-    eval_dataset: str | None = None,
+    dataset: str | list[Any],
+    eval_dataset: str | list[Any] | None = None,
     scorer: str | None = None,
     disable_scoring: bool = False,
     run_name: str | None = None,
@@ -2619,12 +2688,14 @@ async def handle_start_training(
     else:
         gpu_info = f"remote ({remote})"
 
-    # Validate dataset paths
-    ds_path = _validate_path(project_dir, dataset)
-    data_parquet = ds_path / "data.parquet"
-    if not data_parquet.exists():
-        return ToolResult(content=f"Error: dataset not found at {dataset}/data.parquet")
-    dataset_config_path = data_parquet.relative_to(project_dir.resolve()).as_posix()
+    # Validate dataset source(s). A single string or a list of sources to
+    # combine; train sources may carry an integer `repeat` over-sampling
+    # factor. Resolves to canonical {"path", "repeat", "source"} entries.
+    dataset_sources, train_resolved, ds_err = _resolve_training_sources(
+        project_dir, dataset, kind="dataset", allow_repeat=True
+    )
+    if ds_err:
+        return ToolResult(content=ds_err)
 
     # eval_dataset is mandatory: the sweep needs a held-out signal to pick its
     # winner, and the judge eval-of-best needs rollouts to score. (The tool
@@ -2638,28 +2709,41 @@ async def handle_start_training(
             )
         )
 
-    eval_parquet_path: str | None = None
-    if eval_dataset:
-        eval_ds_path = _validate_path(project_dir, eval_dataset)
-        eval_parquet = eval_ds_path / "data.parquet"
-        if not eval_parquet.exists():
-            return ToolResult(
-                content=f"Error: eval dataset not found at {eval_dataset}/data.parquet"
-            )
-        eval_parquet_path = eval_parquet.relative_to(project_dir.resolve()).as_posix()
-        # dataset and eval_dataset must be DISTINCT. Evaluating on the
-        # training prompts is exactly the leak the train/eval split exists
-        # to prevent — reject identical resolved paths rather than silently
-        # scoring the model on data it trained on.
-        if data_parquet.resolve() == eval_parquet.resolve():
+    eval_sources, eval_resolved, eval_err = _resolve_training_sources(
+        project_dir, eval_dataset, kind="eval_dataset", allow_repeat=False
+    )
+    if eval_err:
+        return ToolResult(content=eval_err)
+
+    # Reject duplicate eval sources — scoring the same set twice would
+    # double-count it in the macro-average.
+    eval_seen: set[str] = set()
+    for p in eval_resolved:
+        key = str(p)
+        if key in eval_seen:
             return ToolResult(
                 content=(
-                    "Error: eval_dataset must be different from dataset — they both "
-                    f"resolve to {dataset_config_path}. Evaluating on the training "
-                    "prompts leaks train into eval. Pass a separate held-out eval set "
-                    "(e.g. 'datasets/<name>_eval')."
+                    "Error: eval_dataset lists the same source twice "
+                    f"({p.name}). Each eval source must be distinct so the "
+                    "macro-average weights them once each."
                 )
             )
+        eval_seen.add(key)
+
+    # dataset and eval_dataset must be DISTINCT. Evaluating on the training
+    # prompts is exactly the leak the train/eval split exists to prevent —
+    # reject any overlap between a train source and an eval source.
+    overlap = {str(p) for p in train_resolved} & eval_seen
+    if overlap:
+        names = ", ".join(sorted(Path(p).as_posix() for p in overlap))
+        return ToolResult(
+            content=(
+                "Error: eval_dataset must be different from dataset — these "
+                f"source(s) appear in both: {names}. Evaluating on the training "
+                "prompts leaks train into eval. Pass separate held-out eval "
+                "set(s) (e.g. 'datasets/<name>_eval')."
+            )
+        )
 
     # On-policy DPO builds its preference pairs by judge-scoring generated
     # rollouts every iteration, so a scorer is mandatory — scoring cannot be
@@ -2721,7 +2805,7 @@ async def handle_start_training(
     config: dict[str, Any] = {
         "type": type,
         "base_model": base_model,
-        "dataset": dataset_config_path,
+        "dataset": _sources_to_config(dataset_sources),
         "training": {
             "learning_rate": lr,
             "max_seq_length": 2048,
@@ -2743,8 +2827,8 @@ async def handle_start_training(
         "manifest": ["base_model", "dataset"],
     }
 
-    if eval_parquet_path:
-        config["eval_dataset"] = eval_parquet_path
+    if eval_sources:
+        config["eval_dataset"] = _sources_to_config(eval_sources)
         config["eval_on_checkpoints"] = True
         config["manifest"].append("eval_dataset")
     if scorer_path:
@@ -2757,6 +2841,16 @@ async def handle_start_training(
         config["num_iterations"] = num_iterations
         config["dpo_beta"] = dpo_beta
         config["golden_source"] = golden_source
+
+    # Human-readable summary of the (possibly multiple) training sources,
+    # e.g. "datasets/type_a + datasets/type_b (×3)".
+    def _summarize(entry: dict[str, Any]) -> str:
+        d = Path(entry["path"]).parent.as_posix()
+        rep = entry.get("repeat", 1)
+        return f"{d} (×{rep})" if rep and rep > 1 else d
+
+    dataset_summary = " + ".join(_summarize(e) for e in dataset_sources)
+    eval_summary = " + ".join(Path(e["path"]).parent.as_posix() for e in eval_sources)
 
     # Permission check. Training has its own permission domain (see
     # permissions.check_training_permission) so approving a run never grants
@@ -2771,7 +2865,8 @@ async def handle_start_training(
                 f"The agent wants to start a {type.upper()} training run:\n"
                 f"  Run:       {run_name}\n"
                 f"  Model:     {base_model}\n"
-                f"  Dataset:   {dataset}\n"
+                f"  Dataset:   {dataset_summary}\n"
+                f"  Eval:      {eval_summary}\n"
                 f"  GPU:       {gpu_info}\n\n"
                 f"Allow execution?"
             ),
@@ -3218,6 +3313,18 @@ def _format_status(run_name: str, status: Any, run_dir: Path) -> str:
                     mean_score = result.get("scores", {}).get("mean")
                     if mean_score is not None:
                         eval_results.append(f"    {cp_dir.name}: mean={mean_score:.2f}")
+                        # When multiple eval sources were scored, the headline
+                        # mean is a macro-average — show the per-source breakdown.
+                        per_source = result.get("per_source") or {}
+                        if len(per_source) > 1:
+                            for label in sorted(per_source):
+                                src_mean = (
+                                    per_source[label].get("scores", {}).get("mean")
+                                )
+                                if src_mean is not None:
+                                    eval_results.append(
+                                        f"      {label}: mean={src_mean:.2f}"
+                                    )
                 except (json.JSONDecodeError, OSError):
                     pass
         if eval_results:
@@ -3630,7 +3737,7 @@ async def handle_start_local_eval(
     project_dir: Path,
     *,
     model_path: str,
-    dataset: str,
+    dataset: str | list[Any],
     scorer: str,
     run_name: str | None = None,
     system_prompt_path: str | None = None,
@@ -3683,10 +3790,14 @@ async def handle_start_local_eval(
     if not model_dir.exists():
         return ToolResult(content=f"Error: model not found at {model_path}")
 
-    ds_path = _validate_path(project_dir, dataset)
-    data_parquet = ds_path / "data.parquet"
-    if not data_parquet.exists():
-        return ToolResult(content=f"Error: dataset not found at {dataset}/data.parquet")
+    # Eval dataset(s) — one path or a list of held-out sources. Multiple
+    # sources are scored separately and combined into a macro-average (each
+    # source weighted equally), same as the training eval-of-best.
+    eval_sources, _eval_resolved, ds_err = _resolve_training_sources(
+        project_dir, dataset, kind="dataset", allow_repeat=False
+    )
+    if ds_err:
+        return ToolResult(content=ds_err)
 
     scorer_resolved = _validate_path(project_dir, scorer)
     if not scorer_resolved.exists():
@@ -3711,7 +3822,7 @@ async def handle_start_local_eval(
     config: dict[str, Any] = {
         "type": "infer",
         "base_model": str(model_dir),
-        "dataset": str(data_parquet),
+        "dataset": _sources_to_config(eval_sources),
         "scorer": scorer,
         "max_new_tokens": max_new_tokens,
         "manifest": ["base_model", "dataset", "scorer"],
@@ -3783,12 +3894,13 @@ async def handle_eval_hf_model(
             content=f"Error: judge_size must be small/medium/large, got {judge_size!r}"
         )
 
-    ds_path = _validate_path(project_dir, eval_dataset)
-    data_parquet = ds_path / "data.parquet"
-    if not data_parquet.exists():
-        return ToolResult(
-            content=f"Error: eval dataset not found at {eval_dataset}/data.parquet"
-        )
+    # Eval dataset(s) — one path or a list of held-out sources, scored
+    # separately and macro-averaged sandbox-side.
+    eval_sources, _eval_resolved, ds_err = _resolve_training_sources(
+        project_dir, eval_dataset, kind="eval_dataset", allow_repeat=False
+    )
+    if ds_err:
+        return ToolResult(content=ds_err)
 
     scorer_resolved = _validate_path(project_dir, scorer)
     if not scorer_resolved.exists():
@@ -3819,7 +3931,7 @@ async def handle_eval_hf_model(
         "hf_repo": repo,
         "revision": revision,
         "training_method": training_method,
-        "eval_dataset": f"{eval_dataset}/data.parquet",
+        "eval_dataset": _sources_to_config(eval_sources),
         "scorer": scorer,
         "judge_size": judge_size,
         "max_new_tokens": max_new_tokens,
@@ -3894,7 +4006,7 @@ async def handle_eval_hf_model(
 async def _start_local_eval_remote(
     project_dir: Path,
     model_path: str,
-    dataset: str,
+    dataset: str | list[Any],
     scorer: str,
     run_name: str | None,
     remote_name: str,
@@ -3920,11 +4032,13 @@ async def _start_local_eval_remote(
     if remote_config.type == "ssh_slurm":
         return ToolResult(content="Error: SSH+Slurm backend is not yet implemented.")
 
-    # Validate local paths
-    ds_path = _validate_path(project_dir, dataset)
-    data_parquet = ds_path / "data.parquet"
-    if not data_parquet.exists():
-        return ToolResult(content=f"Error: dataset not found at {dataset}/data.parquet")
+    # Validate eval dataset source(s) — one path or a list of held-out
+    # sources, scored separately and macro-averaged (same as the local path).
+    eval_sources, _eval_resolved, ds_err = _resolve_training_sources(
+        project_dir, dataset, kind="dataset", allow_repeat=False
+    )
+    if ds_err:
+        return ToolResult(content=ds_err)
 
     scorer_resolved = _validate_path(project_dir, scorer)
     if not scorer_resolved.exists():
@@ -3946,7 +4060,7 @@ async def _start_local_eval_remote(
     config: dict[str, Any] = {
         "type": "infer",
         "base_model": model_path,
-        "dataset": str(data_parquet),
+        "dataset": _sources_to_config(eval_sources),
         "scorer": scorer,
         "max_new_tokens": max_new_tokens,
         "manifest": ["base_model", "dataset", "scorer"],

@@ -235,34 +235,22 @@ async def _score_run_eval_async(
     if scorer_path is None:
         return None
 
-    from lqh.scoring import run_scoring
+    from lqh.scoring import score_predictions_by_source
 
     client = _make_client()
     try:
-        await run_scoring(
-            dataset_path=preds,
+        # Per-source scoring writes eval_result.json (with per_source +
+        # macro-average headline under scores.mean) directly into run_dir,
+        # which the publisher classifies as an eval_result artifact (see
+        # lqh/remote/publish.py:_resolve_candidates). The returned payload is
+        # surfaced to the sweep / eval_hf caller.
+        payload = await score_predictions_by_source(
+            predictions_path=preds,
             scorer_path=scorer_path,
             output_dir=run_dir,
             client=client,
-            run_inference=False,
         )
-        summary_path = run_dir / "summary.json"
-        summary: dict[str, Any] = {}
-        if summary_path.exists():
-            try:
-                summary = json.loads(summary_path.read_text())
-            except (OSError, json.JSONDecodeError):
-                summary = {}
-        # Drop an eval_result.json next to the predictions so the
-        # publisher classifies it as an eval_result artifact (see
-        # lqh/remote/publish.py:_resolve_candidates).
-        (run_dir / "eval_result.json").write_text(
-            json.dumps({
-                "summary": summary,
-                "predictions_path": str(preds.relative_to(run_dir)),
-            }, indent=2) + "\n"
-        )
-        return summary or None
+        return payload or None
     finally:
         try:
             await client.close()

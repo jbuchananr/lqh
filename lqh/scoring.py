@@ -61,7 +61,7 @@ SCORE_RESPONSE_SCHEMA = {
                 },
                 "score": {
                     "type": "integer",
-                    "description": "Score from 1 to 10.",
+                    "description": "Score from 0 to 10 (0 is the worst grade, reserved for empty/refusal/unrelated output).",
                 },
             },
             "required": ["reasoning", "score"],
@@ -206,14 +206,14 @@ _TOOL_CALL_JUDGE_SYSTEM = (
     "4. Only evaluate actual tool calls (marked as [Tool Calls]), "
     "NOT text mentions of tools in the assistant's prose\n"
     "First write your reasoning (2-3 concise sentences), then give "
-    "a score from 1 to 10. Output JSON with keys: reasoning, score."
+    "a score from 0 to 10. Output JSON with keys: reasoning, score."
 )
 
 _DEFAULT_JUDGE_SYSTEM = (
     "You are a strict but fair evaluator of AI-generated responses. "
     "You will receive a conversation sample and scoring criteria. "
     "First write your reasoning (2-3 concise sentences), then give "
-    "a score from 1 to 10. Output JSON with keys: reasoning, score."
+    "a score from 0 to 10. Output JSON with keys: reasoning, score."
 )
 
 
@@ -465,9 +465,15 @@ async def run_scoring(
                         raise ValueError("Empty choices in scoring response")
                     raw = response.choices[0].message.content or ""
                     score, reasoning = _parse_score_response(raw)
-                    if score > 0:
+                    # A parseable judge response is a real score — including 0,
+                    # which is the rubric's worst-quality grade (empty/refusal/
+                    # unrelated), NOT an infrastructure failure. Only parse/API
+                    # errors (flagged by is_scoring_error) are retried/dropped.
+                    if not is_scoring_error(reasoning):
                         success = True
                         break
+                    if attempt < max_retries:
+                        await asyncio.sleep(2 ** attempt)
                 except Exception as exc:
                     logger.warning(
                         "Scoring failed for sample %d (attempt %d/%d): %s",
@@ -513,9 +519,11 @@ async def run_scoring(
     ]
     await asyncio.gather(*tasks)
 
-    # Build output
+    # Build output. Aggregate over every successfully judged sample — a score
+    # of 0 is a valid grade, not a failure. Only parse/API errors (which carry
+    # an is_scoring_error reasoning marker) are excluded from the stats.
     rows = [r for r in results if r is not None]
-    scores = [r["score"] for r in rows if r["score"] > 0]
+    scores = [r["score"] for r in rows if not is_scoring_error(r["reasoning"])]
 
     mean_score = sum(scores) / len(scores) if scores else 0.0
     sorted_scores = sorted(scores)
@@ -639,6 +647,147 @@ async def run_scoring(
     )
 
 
+def _source_map(predictions_path: Path) -> dict[int, str]:
+    """Read a predictions parquet and return ``{sample_index: source}``.
+
+    Returns an empty map when the file has no ``source`` column (legacy
+    single-source predictions) — callers then treat everything as one group.
+    """
+    try:
+        table = pq.read_table(str(predictions_path))
+    except Exception:
+        return {}
+    if "source" not in table.column_names:
+        return {}
+    idx_col = table.column("sample_index")
+    src_col = table.column("source")
+    return {idx_col[i].as_py(): src_col[i].as_py() for i in range(len(table))}
+
+
+def _score_stats(values: list[float]) -> dict[str, float]:
+    """mean/median/std/min/max over a list of scores (empty → zeros)."""
+    if not values:
+        return {"mean": 0.0, "median": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
+    ordered = sorted(values)
+    mean = sum(values) / len(values)
+    median = ordered[len(ordered) // 2]
+    std = (
+        (sum((v - mean) ** 2 for v in values) / (len(values) - 1)) ** 0.5
+        if len(values) > 1
+        else 0.0
+    )
+    return {
+        "mean": round(mean, 2),
+        "median": round(median, 2),
+        "std": round(std, 2),
+        "min": round(min(values), 2),
+        "max": round(max(values), 2),
+    }
+
+
+async def score_predictions_by_source(
+    predictions_path: Path,
+    scorer_path: Path,
+    output_dir: Path,
+    client: AsyncOpenAI,
+    *,
+    model_size: str = "small",
+    **scoring_kwargs: Any,
+) -> dict[str, Any]:
+    """Judge-score predictions, partition scores by their ``source`` column,
+    and write a multi-source ``eval_result.json``.
+
+    Runs :func:`run_scoring` once (one efficient pass over all predictions),
+    then groups the per-sample scores by the source each prediction came from.
+    The headline ``scores.mean`` is the **macro-average** — the mean of the
+    per-source means, weighting every source equally regardless of size;
+    ``scores_weighted_mean`` is the by-count mean for reference. When the
+    predictions carry no ``source`` column the whole set is one group labelled
+    ``"all"`` — byte-for-byte the legacy single-source behaviour.
+
+    Writes ``output_dir/eval_result.json`` and returns that payload (so cloud
+    callers can surface it without re-reading the file).
+    """
+    result = await run_scoring(
+        dataset_path=predictions_path,
+        scorer_path=scorer_path,
+        output_dir=output_dir,
+        client=client,
+        model_size=model_size,
+        run_inference=False,
+        **scoring_kwargs,
+    )
+
+    src_by_idx = _source_map(predictions_path)
+
+    # Collect valid (non-error) scores grouped by source from results.parquet.
+    grouped: dict[str, list[float]] = {}
+    results_path = output_dir / "results.parquet"
+    if results_path.exists():
+        rtable = pq.read_table(str(results_path))
+        cols = rtable.column_names
+        idx_c = rtable.column("sample_index")
+        score_c = rtable.column("score")
+        reason_c = rtable.column("reasoning") if "reasoning" in cols else None
+        for i in range(len(rtable)):
+            reasoning = reason_c[i].as_py() if reason_c is not None else None
+            if is_scoring_error(reasoning):
+                continue
+            sample_idx = idx_c[i].as_py()
+            label = src_by_idx.get(sample_idx, "all")
+            grouped.setdefault(label, []).append(float(score_c[i].as_py()))
+
+    # Every source that appears in the predictions must show up in per_source,
+    # even one whose samples ALL failed to score — otherwise an all-failures
+    # source would silently vanish and the macro headline would be averaged
+    # over the survivors only. Such a source is reported with num_scored=0 but
+    # excluded from the macro means (it has no mean to contribute).
+    all_labels = set(grouped) | set(src_by_idx.values())
+    if not all_labels:
+        all_labels = {"all"}
+
+    per_source: dict[str, Any] = {}
+    per_source_means: list[float] = []
+    per_source_medians: list[float] = []
+    for label in sorted(all_labels):
+        scores_list = grouped.get(label, [])
+        stats = _score_stats(scores_list)
+        per_source[label] = {
+            "num_scored": len(scores_list),
+            "scores": stats,
+        }
+        if scores_list:
+            per_source_means.append(stats["mean"])
+            per_source_medians.append(stats["median"])
+
+    # Macro-average headline: each source weighted equally.
+    macro_mean = (
+        round(sum(per_source_means) / len(per_source_means), 2)
+        if per_source_means
+        else round(result.mean_score, 2)
+    )
+    macro_median = (
+        round(sum(per_source_medians) / len(per_source_medians), 2)
+        if per_source_medians
+        else round(result.median_score, 2)
+    )
+
+    payload: dict[str, Any] = {
+        "num_scored": result.scored,
+        "num_failed": result.failed,
+        # Headline = macro-average (mean of per-source means). Kept under the
+        # existing scores.mean/median keys so all current readers keep working.
+        "scores": {"mean": macro_mean, "median": macro_median},
+        # By-count mean over every scored sample, for reference / comparison.
+        "scores_weighted_mean": round(result.mean_score, 2),
+        "per_source": per_source,
+    }
+    (output_dir / "eval_result.json").write_text(
+        json.dumps(payload, indent=2) + "\n", encoding="utf-8"
+    )
+    return payload
+
+
 async def run_data_scoring(
     dataset_dir: Path,
     scorer_path: Path,
@@ -715,18 +864,24 @@ async def run_data_scoring(
                         raise ValueError("Empty choices in scoring response")
                     raw = response.choices[0].message.content or ""
                     score, reasoning = _parse_score_response(raw)
-                    if score > 0:
+                    # 0 is a valid worst-quality grade, not a failure; only
+                    # parse/API errors are retried and excluded from the stats.
+                    if not is_scoring_error(reasoning):
                         success = True
                         break
+                    if attempt < 2:
+                        await asyncio.sleep(2 ** attempt)
                 except Exception as exc:
                     logger.warning("Scoring sample %d attempt %d: %s", index, attempt + 1, exc)
                     if attempt < 2:
                         await asyncio.sleep(2 ** attempt)
+                    else:
+                        reasoning = f"[Scoring error] {exc}"
 
             async with lock:
                 results.append({
                     "sample_index": index,
-                    "score": score,
+                    "score": score if success else 0.0,
                     "reasoning": reasoning,
                     "scorer": scorer_path.name,
                 })
@@ -764,7 +919,8 @@ async def run_data_scoring(
     )
     pq.write_table(scores_table, dataset_dir / "scores.parquet")
 
-    scores = [r["score"] for r in results if r["score"] > 0]
+    # Aggregate over judged samples (0 included); exclude only parse/API errors.
+    scores = [r["score"] for r in results if not is_scoring_error(r["reasoning"])]
     mean_score = sum(scores) / len(scores) if scores else 0.0
     sorted_scores = sorted(scores)
     median_score = sorted_scores[len(sorted_scores) // 2] if sorted_scores else 0.0
@@ -893,9 +1049,13 @@ async def run_data_filter(
                         raise ValueError("Empty choices in scoring response")
                     raw = response.choices[0].message.content or ""
                     score, reasoning = _parse_score_response(raw)
-                    if score > 0:
+                    # 0 is a valid worst-quality grade (it just won't clear the
+                    # keep threshold); only parse/API errors are retried/dropped.
+                    if not is_scoring_error(reasoning):
                         success = True
                         break
+                    if attempt < max_retries:
+                        await asyncio.sleep(2 ** attempt)
                 except Exception as exc:
                     logger.warning(
                         "run_data_filter: sample %d attempt %d failed: %s",
@@ -957,8 +1117,9 @@ async def run_data_filter(
 
     kept_count = len(kept_indices)
     dropped = total - kept_count - failed_count
-    non_zero_scores = [r["score"] for r in rows if r["score"] > 0]
-    mean_score = sum(non_zero_scores) / len(non_zero_scores) if non_zero_scores else 0.0
+    # Mean over judged samples (0 included); exclude only parse/API errors.
+    valid_scores = [r["score"] for r in rows if not is_scoring_error(r["reasoning"])]
+    mean_score = sum(valid_scores) / len(valid_scores) if valid_scores else 0.0
 
     summary = {
         "input": str(input_path),

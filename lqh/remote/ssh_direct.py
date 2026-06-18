@@ -486,18 +486,38 @@ def _rewrite_config_paths(
     too.
     """
     project_str = str(project_dir)
-    path_keys = (
-        "dataset", "eval_dataset", "base_model", "scorer",
-    )
+    # base_model/scorer are always single strings; dataset/eval_dataset may be
+    # a single string or a multi-source list (strings or {"path": ...} objects).
+    scalar_keys = ("base_model", "scorer")
+    list_keys = ("dataset", "eval_dataset")
+
+    def _rewrite_str(value: str) -> str:
+        if value.startswith(project_str):
+            return remote_root + value[len(project_str):]
+        return value
 
     def _rewrite_level(d: dict[str, Any]) -> dict[str, Any]:
         out = dict(d)
-        for key in path_keys:
+        for key in scalar_keys:
             value = out.get(key)
-            if not value or not isinstance(value, str):
-                continue
-            if value.startswith(project_str):
-                out[key] = remote_root + value[len(project_str):]
+            if isinstance(value, str) and value:
+                out[key] = _rewrite_str(value)
+        for key in list_keys:
+            value = out.get(key)
+            if isinstance(value, str) and value:
+                out[key] = _rewrite_str(value)
+            elif isinstance(value, list):
+                new_list: list[Any] = []
+                for item in value:
+                    if isinstance(item, str):
+                        new_list.append(_rewrite_str(item))
+                    elif isinstance(item, dict) and isinstance(item.get("path"), str):
+                        new_item = dict(item)
+                        new_item["path"] = _rewrite_str(item["path"])
+                        new_list.append(new_item)
+                    else:
+                        new_list.append(item)
+                out[key] = new_list
         return out
 
     result = _rewrite_level(config)
@@ -516,22 +536,23 @@ def _resolve_local_manifest(
     in a ``manifest`` key. Recurses one level into ``base_config`` so
     hyperparameter-sweep payloads sync their datasets correctly.
     """
+    from lqh.sync import iter_path_values
+
     path_keys = ("dataset", "eval_dataset", "scorer")
 
     def _collect(d: dict[str, Any], into: list[Path]) -> None:
         for key in path_keys:
-            value = d.get(key)
-            if not value or not isinstance(value, str):
-                continue
-            candidate = Path(value)
-            if not candidate.is_absolute():
-                candidate = project_dir / candidate
-            if candidate.exists():
-                # For parquet files in a dataset dir, sync the parent
-                if candidate.is_file() and candidate.suffix == ".parquet":
-                    into.append(candidate.parent)
-                else:
-                    into.append(candidate)
+            # dataset/eval_dataset may list multiple sources — sync every one.
+            for raw in iter_path_values(d.get(key)):
+                candidate = Path(raw)
+                if not candidate.is_absolute():
+                    candidate = project_dir / candidate
+                if candidate.exists():
+                    # For parquet files in a dataset dir, sync the parent
+                    if candidate.is_file() and candidate.suffix == ".parquet":
+                        into.append(candidate.parent)
+                    else:
+                        into.append(candidate)
 
     paths: list[Path] = []
     _collect(config, paths)

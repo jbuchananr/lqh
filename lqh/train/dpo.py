@@ -31,7 +31,7 @@ from transformers import (
 from trl import DPOConfig, DPOTrainer
 
 from lqh.train.data_utils import (
-    load_chatml_dataset,
+    load_chatml_datasets,
     load_preferences_parquet,
     split_train_eval,
 )
@@ -457,14 +457,19 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
     preference_convos: list[list[dict[str, str]]] = []
     if not skip_generation_if_preferences_exist:
         print(f"Loading prompt dataset for on-policy generation: {prompt_dataset_path}")
-        preference_convos = load_chatml_dataset(prompt_dataset_path)
+        # config['dataset'] may list multiple sources — DPO rolls out from the
+        # concatenated prompt set (integer `repeat` factors are honoured).
+        preference_convos = load_chatml_datasets(prompt_dataset_path)
 
     # Load held-out eval prompts once (cheap; just a parquet read).
     held_out_convos: list[list[dict[str, str]]] | None = None
     if held_out_eval_path:
         print(f"Loading held-out eval dataset: {held_out_eval_path}")
         try:
-            held_out_convos = load_chatml_dataset(held_out_eval_path)
+            # Accept one or many sources (concatenated). This per-iteration
+            # held-out set is an internal early-abort signal, scored as a
+            # single aggregate — distinct from the per-source eval-of-best.
+            held_out_convos = load_chatml_datasets(held_out_eval_path)
             print(f"  Held-out eval has {len(held_out_convos)} samples")
         except Exception as exc:
             print(f"  WARNING: failed to load held-out eval dataset: {exc}")

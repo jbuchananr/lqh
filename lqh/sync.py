@@ -18,7 +18,28 @@ __all__ = [
     "SyncBackend",
     "LocalSync",
     "resolve_manifest",
+    "iter_path_values",
 ]
+
+
+def iter_path_values(value: Any) -> list[str]:
+    """Extract path strings from a config value that may carry one or many.
+
+    Dataset/eval_dataset config keys can be a single path string, a list of
+    path strings, or a list of ``{"path": str, ...}`` source objects (the
+    multi-source form). Returns the flat list of path strings; anything else
+    is ignored.
+    """
+    if isinstance(value, str):
+        return [value]
+    out: list[str] = []
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, str):
+                out.append(item)
+            elif isinstance(item, dict) and isinstance(item.get("path"), str):
+                out.append(item["path"])
+    return out
 
 
 @runtime_checkable
@@ -86,6 +107,7 @@ def resolve_manifest(
             manifest_keys = keys
             break
     paths: list[Path] = []
+    seen: set[str] = set()
     project_resolved = project_dir.resolve()
     for key in manifest_keys:
         value = None
@@ -96,10 +118,17 @@ def resolve_manifest(
                 break
         if value is None:
             continue
-        if not isinstance(value, str):
-            continue
-        value_path = Path(value)
-        candidate = value_path if value_path.is_absolute() else project_resolved / value_path
-        if candidate.exists():
-            paths.append(candidate.resolve())
+        # A key may resolve to one path (string) or many (multi-source
+        # dataset/eval_dataset lists). Expand and resolve each.
+        for raw in iter_path_values(value):
+            value_path = Path(raw)
+            candidate = (
+                value_path if value_path.is_absolute() else project_resolved / value_path
+            )
+            if candidate.exists():
+                resolved = candidate.resolve()
+                key_str = str(resolved)
+                if key_str not in seen:
+                    seen.add(key_str)
+                    paths.append(resolved)
     return paths

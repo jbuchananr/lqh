@@ -25,7 +25,8 @@ from trl import SFTConfig, SFTTrainer
 
 from lqh.train.data_utils import (
     chatml_to_sft_dataset,
-    load_chatml_dataset,
+    load_chatml_datasets,
+    load_eval_sources,
     split_train_eval,
 )
 from lqh.train.progress import write_eval_request, write_progress, write_status
@@ -162,50 +163,57 @@ def _run_checkpoint_eval(
     if not eval_dataset_path:
         return
 
-    eval_convos = load_chatml_dataset(eval_dataset_path)
+    # Eval sources are kept DISTINCT and each prediction row is tagged with
+    # its source, so the judge can score every source separately and combine
+    # them into a macro-average (see score_predictions_by_source).
+    eval_srcs = load_eval_sources(eval_dataset_path)
     max_seq = config.get("training", {}).get("max_seq_length", 2048)
 
     predictions: list[dict[str, Any]] = []
     model.eval()
 
-    for i, conv in enumerate(eval_convos):
-        # Strip trailing assistant turn if present (we want the model to generate)
-        prompt_msgs = conv
-        if conv and conv[-1].get("role") == "assistant":
-            prompt_msgs = conv[:-1]
+    idx = 0
+    for source_label, eval_convos in eval_srcs:
+        for conv in eval_convos:
+            # Strip trailing assistant turn if present (we want the model to generate)
+            prompt_msgs = conv
+            if conv and conv[-1].get("role") == "assistant":
+                prompt_msgs = conv[:-1]
 
-        try:
-            inputs = tokenizer.apply_chat_template(
-                prompt_msgs,
-                return_tensors="pt",
-                add_generation_prompt=True,
-                return_dict=True,
-            )
-            input_ids = inputs["input_ids"].to(model.device)
-
-            with torch.no_grad():
-                output_ids = model.generate(
-                    input_ids,
-                    max_new_tokens=min(max_seq, 1024),
-                    do_sample=False,
+            try:
+                inputs = tokenizer.apply_chat_template(
+                    prompt_msgs,
+                    return_tensors="pt",
+                    add_generation_prompt=True,
+                    return_dict=True,
                 )
-            response = tokenizer.decode(
-                output_ids[0][input_ids.shape[-1]:],
-                skip_special_tokens=True,
+                input_ids = inputs["input_ids"].to(model.device)
+
+                with torch.no_grad():
+                    output_ids = model.generate(
+                        input_ids,
+                        max_new_tokens=min(max_seq, 1024),
+                        do_sample=False,
+                    )
+                response = tokenizer.decode(
+                    output_ids[0][input_ids.shape[-1]:],
+                    skip_special_tokens=True,
+                )
+            except Exception as exc:
+                response = f"[generation error: {exc}]"
+
+            # Store the full conversation including model response
+            full_conv = prompt_msgs + [{"role": "assistant", "content": response}]
+            predictions.append(
+                {
+                    "sample_index": idx,
+                    "messages": json.dumps(full_conv),
+                    "source": source_label,
+                }
             )
-        except Exception as exc:
-            response = f"[generation error: {exc}]"
+            idx += 1
 
-        # Store the full conversation including model response
-        full_conv = prompt_msgs + [{"role": "assistant", "content": response}]
-        predictions.append(
-            {
-                "sample_index": i,
-                "messages": json.dumps(full_conv),
-            }
-        )
-
-    # Write predictions as parquet
+    # Write predictions as parquet (single combined file, source-tagged)
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -213,6 +221,7 @@ def _run_checkpoint_eval(
         {
             "sample_index": [p["sample_index"] for p in predictions],
             "messages": [p["messages"] for p in predictions],
+            "source": [p["source"] for p in predictions],
         }
     )
     pq.write_table(table, checkpoint_dir / "predictions.parquet")
@@ -316,13 +325,21 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
     # train-only and the sweep's proxy metric stays NaN, marking the
     # config "failed". That bit us on the before/after test.
     print(f"Loading dataset: {dataset_path}")
-    conversations = load_chatml_dataset(dataset_path)
+    conversations = load_chatml_datasets(dataset_path)
     eval_dataset_path = config.get("eval_dataset")
     eval_split_ratio = float(training_cfg.get("eval_split_ratio", 0.1))
     if eval_dataset_path:
-        print(f"Loading explicit eval_dataset: {eval_dataset_path}")
+        # The in-training eval set (drives eval_loss / load_best_model_at_end
+        # / the sweep proxy) is the CONCATENATION of all eval sources — a
+        # single scalar selection signal. Per-source judge scoring happens
+        # separately in _run_checkpoint_eval, which keeps sources distinct.
+        eval_srcs = load_eval_sources(eval_dataset_path)
+        print(
+            "Loading explicit eval_dataset: "
+            + ", ".join(f"{label}({len(c)})" for label, c in eval_srcs)
+        )
         train_convos = conversations
-        eval_convos = load_chatml_dataset(eval_dataset_path)
+        eval_convos = [conv for _label, convos in eval_srcs for conv in convos]
     elif eval_split_ratio > 0:
         train_convos, eval_convos = split_train_eval(
             conversations, eval_split_ratio, seed=0

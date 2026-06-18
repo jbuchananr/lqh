@@ -278,6 +278,28 @@ These are read when `enable_sweep=false`:
 - **`num_iterations`** (default: 5) — DPO only.
 - **`dpo_beta`** (default: 0.1) — DPO KL anchor strength.
 
+### Combining multiple data sources
+
+Both `dataset` and `eval_dataset` accept **either a single path or a list** of dataset dirs. Use a list to:
+
+- **Combine sub-tasks** produced by separate data-gen pipelines (e.g. type-A + type-B requests).
+- **Mix your data with HuggingFace datasets** — `pull`/`hf_pull` the hub dataset first (it lands at `datasets/<repo>/`), then list it alongside your own dirs.
+- **Accumulate scale-up batches** — combine the 2k + 10k + 20k parquet collections instead of discarding the earlier ones.
+
+```python
+start_training(
+    type="sft",
+    base_model="LiquidAI/LFM2.5-1.2B-Instruct",
+    dataset=["datasets/type_a", {"path": "datasets/type_b", "repeat": 3}],   # train: concatenated; type_b over-sampled 3x
+    eval_dataset=["datasets/type_a_eval", "datasets/type_b_eval"],            # eval: kept separate, scored per-source
+    scorer="evals/scorers/default.md",
+)
+```
+
+- **Train (`dataset`)** sources are **concatenated**. An optional integer `repeat` on a source over-samples it in the blend (changes the per-batch source ratio; orthogonal to `num_epochs`). DPO concatenates its prompt sources the same way.
+- **Eval (`eval_dataset`)** sources are kept **separate**: the best checkpoint is judge-scored on each source independently. `training_status` and `eval_result.json` show a **per-source breakdown** plus a **macro-average** headline (each source weighted equally, regardless of size). The sweep still selects its winner on the in-training `eval_loss` computed over the concatenation of all eval sources. (`repeat` is not accepted for eval.)
+- Every eval source must be **distinct** from every training source (the call is rejected on overlap).
+
 ### `eval_dataset` is required; scoring is on by default
 
 **`eval_dataset` is mandatory.** `start_training` rejects the call without it. It is the held-out set the sweep selects the winner on (for SFT this is the in-training `eval_loss`; for DPO the proxy is a preference split) **and** the set the best checkpoint is judge-scored on. The proxy only *selects* the winner — it is not the result you report to the user.

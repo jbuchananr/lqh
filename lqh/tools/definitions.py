@@ -1188,27 +1188,71 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
                         ),
                     },
                     "dataset": {
-                        "type": "string",
+                        "oneOf": [
+                            {"type": "string"},
+                            {
+                                "type": "array",
+                                "items": {
+                                    "oneOf": [
+                                        {"type": "string"},
+                                        {
+                                            "type": "object",
+                                            "properties": {
+                                                "path": {"type": "string"},
+                                                "repeat": {
+                                                    "type": "integer",
+                                                    "minimum": 1,
+                                                },
+                                            },
+                                            "required": ["path"],
+                                            "additionalProperties": False,
+                                        },
+                                    ]
+                                },
+                            },
+                        ],
                         "description": (
-                            "Relative path to the training dataset directory "
-                            "(e.g. 'datasets/summarization_v1'). Must contain data.parquet. "
-                            "This is the single source of training prompts: SFT trains on "
-                            "these conversations; DPO generates its on-policy rollouts from "
-                            "these prompts. Never used for evaluation — that is "
-                            "`eval_dataset`."
+                            "Training data source(s). EITHER a single relative path to a "
+                            "dataset directory containing data.parquet "
+                            "(e.g. 'datasets/summarization_v1'), OR a LIST of such paths to "
+                            "combine into one training set "
+                            "(e.g. ['datasets/type_a', 'datasets/type_b']). Use a list to "
+                            "(1) merge sub-datasets from separate pipelines, (2) mix your "
+                            "own data with public/private HuggingFace datasets (run `pull`/"
+                            "`hf_pull` first, then reference the local 'datasets/<repo>' "
+                            "dir), or (3) scale up by combining several parquet collections "
+                            "instead of discarding the smaller earlier ones. Default "
+                            "behavior is plain 1:1 concatenation. To over-sample a source "
+                            "in the blend, pass an object instead of a string: "
+                            "{'path': 'datasets/rare_type', 'repeat': 3} duplicates that "
+                            "source 3× (changes the per-batch source ratio; orthogonal to "
+                            "num_epochs, which controls passes over the whole blend). This "
+                            "is the source of training prompts only — SFT trains on these "
+                            "conversations, DPO generates on-policy rollouts from them; "
+                            "never used for evaluation — that is `eval_dataset`."
                         ),
                     },
                     "eval_dataset": {
-                        "type": "string",
+                        "oneOf": [
+                            {"type": "string"},
+                            {"type": "array", "items": {"type": "string"}},
+                        ],
                         "description": (
-                            "Relative path to the held-out eval dataset directory "
-                            "(must contain data.parquet). REQUIRED — pass the project's "
-                            "eval set (e.g. 'datasets/<name>_eval'), DISTINCT from "
-                            "`dataset`. It is held-out: never used to generate training "
-                            "data, only for evaluation. It is the signal the sweep selects "
-                            "its winner on (for SFT this is the in-training val_loss; for "
-                            "DPO the proxy is a preference split) AND — together with "
-                            "`scorer` — the set the best checkpoint is judge-scored on."
+                            "Held-out eval source(s). EITHER a single relative path to an "
+                            "eval dataset directory (must contain data.parquet), OR a LIST "
+                            "of such paths. REQUIRED, and each source must be DISTINCT from "
+                            "every training source. Unlike `dataset`, eval sources are kept "
+                            "SEPARATE: the best checkpoint is judge-scored on each source "
+                            "independently, producing a per-source score plus a combined "
+                            "MACRO-AVERAGE headline (each source weighted equally, "
+                            "regardless of size) — pass a list "
+                            "(e.g. ['datasets/type_a_eval', 'datasets/type_b_eval']) when "
+                            "you want to measure each sub-task separately rather than only "
+                            "an aggregate. For sweep winner selection the in-training "
+                            "val_loss is computed over the CONCATENATION of all eval "
+                            "sources (a single scalar); for DPO the sweep proxy is a "
+                            "preference split instead. (No `repeat` here — weighting is "
+                            "meaningless for eval.)"
                         ),
                     },
                     "scorer": {
@@ -1394,10 +1438,18 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
                         ),
                     },
                     "dataset": {
-                        "type": "string",
+                        "oneOf": [
+                            {"type": "string"},
+                            {"type": "array", "items": {"type": "string"}},
+                        ],
                         "description": (
-                            "Relative path to the eval dataset directory "
-                            "(must contain data.parquet)."
+                            "Eval dataset source(s): a single relative path to an "
+                            "eval dataset directory (must contain data.parquet), OR a "
+                            "list of such paths. Multiple sources are scored SEPARATELY "
+                            "and combined into a macro-average headline (each source "
+                            "weighted equally) — the per-source breakdown is in the run's "
+                            "eval_result.json. Use a list to measure each sub-task "
+                            "(e.g. ['datasets/type_a_eval', 'datasets/type_b_eval'])."
                         ),
                     },
                     "scorer": {
@@ -1499,10 +1551,17 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
                         ),
                     },
                     "eval_dataset": {
-                        "type": "string",
+                        "oneOf": [
+                            {"type": "string"},
+                            {"type": "array", "items": {"type": "string"}},
+                        ],
                         "description": (
-                            "Relative path to the eval dataset directory "
-                            "(must contain data.parquet)."
+                            "Eval dataset source(s): a single relative path to an "
+                            "eval dataset directory (must contain data.parquet), OR a "
+                            "list of such paths. Multiple sources are scored separately "
+                            "and combined into a macro-average headline (each source "
+                            "weighted equally); the per-source breakdown lands in the "
+                            "run's eval_result.json."
                         ),
                     },
                     "scorer": {

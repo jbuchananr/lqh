@@ -263,40 +263,31 @@ class RunWatcher:
 
         try:
             from lqh.client import create_client
-            from lqh.scoring import run_scoring
+            from lqh.scoring import score_predictions_by_source
 
             client = create_client(self.api_key, self.api_base_url)
 
-            result = await run_scoring(
-                dataset_path=predictions_path,
+            # Per-source scoring: scores each eval source separately and
+            # writes eval_result.json with a per_source breakdown plus a
+            # macro-average headline (scores.mean). Single-source predictions
+            # collapse to one group — identical to the legacy behaviour.
+            payload = await score_predictions_by_source(
+                predictions_path=predictions_path,
                 scorer_path=self.project_dir / scorer_path,
                 output_dir=checkpoint_dir,
                 client=client,
-                run_inference=False,
             )
 
-            # Write eval_result.json
-            eval_result = {
-                "num_scored": result.scored,
-                "num_failed": result.failed,
-                "scores": {
-                    "mean": result.mean_score,
-                    "median": result.median_score,
-                },
-            }
-            (checkpoint_dir / "eval_result.json").write_text(
-                json.dumps(eval_result, indent=2) + "\n"
-            )
-
-            if result.mean_score is not None:
+            mean_score = payload.get("scores", {}).get("mean")
+            if mean_score is not None:
                 self.callbacks.on_eval_scored(
                     self.run_name,
                     checkpoint_dir.name,
-                    result.mean_score,
+                    mean_score,
                 )
                 logger.info(
                     "Scored %s/%s: mean=%.2f",
-                    self.run_name, checkpoint_dir.name, result.mean_score,
+                    self.run_name, checkpoint_dir.name, mean_score,
                 )
 
         except Exception:

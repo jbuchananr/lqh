@@ -302,19 +302,21 @@ async def generate_golden(
 def _golden_from_dataset(
     low_indices: list[int],
     pred_messages: list[list[dict[str, str]]],
-    dataset_path: str,
+    dataset_path: "str | list",
 ) -> dict[int, str]:
-    """Pull golden responses from the original training dataset."""
+    """Pull golden responses from the original training dataset.
+
+    *dataset_path* mirrors ``config['dataset']`` and may be a single path or a
+    list of sources — load it via the same concatenation (and `repeat`
+    semantics) the rollout generation used, so index alignment holds.
+    """
+    from lqh.train.data_utils import load_chatml_datasets
+
     try:
-        table = pq.read_table(dataset_path)
+        dataset_messages = load_chatml_datasets(dataset_path)
     except Exception:
         logger.warning("Could not load dataset at %s for golden responses", dataset_path)
         return {}
-
-    dataset_messages = [
-        json.loads(table.column("messages")[i].as_py())
-        for i in range(len(table))
-    ]
 
     result: dict[int, str] = {}
     for idx in low_indices:

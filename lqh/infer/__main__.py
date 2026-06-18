@@ -40,7 +40,7 @@ def main() -> None:
 def _run_inference(run_dir: Path, config: dict) -> None:
     import torch
 
-    from lqh.train.data_utils import load_chatml_dataset_with_tools
+    from lqh.train.data_utils import load_eval_sources_with_tools
     from lqh.train.load_model import load_for_inference
     from lqh.train.progress import write_eval_request, write_progress, write_status
     from lqh.train.tool_format import get_tool_formatter
@@ -66,7 +66,12 @@ def _run_inference(run_dir: Path, config: dict) -> None:
     )
 
     print(f"Loading dataset: {dataset_path}")
-    conversations, tools_per_sample = load_chatml_dataset_with_tools(dataset_path)
+    # dataset_path may name one or more sources (eval-of-best passes the
+    # eval_dataset list here). Each prediction is tagged with its source so
+    # the judge can score sources separately and macro-average them.
+    conversations, tools_per_sample, sources_per_sample = (
+        load_eval_sources_with_tools(dataset_path)
+    )
 
     max_new_tokens = config.get("max_new_tokens", 4096)
     system_prompt = config.get("system_prompt")
@@ -196,6 +201,7 @@ def _run_inference(run_dir: Path, config: dict) -> None:
         pred_entry: dict[str, Any] = {
             "sample_index": i,
             "messages": json.dumps(full_conv),
+            "source": sources_per_sample[i],
         }
         if sample_tools is not None:
             pred_entry["tools"] = json.dumps(sample_tools)
@@ -217,10 +223,12 @@ def _run_inference(run_dir: Path, config: dict) -> None:
     columns: dict[str, list] = {
         "sample_index": [p["sample_index"] for p in predictions],
         "messages": [p["messages"] for p in predictions],
+        "source": [p["source"] for p in predictions],
     }
     fields = [
         pa.field("sample_index", pa.int64()),
         pa.field("messages", pa.string()),
+        pa.field("source", pa.string()),
     ]
     if has_tools_col:
         columns["tools"] = [p.get("tools") for p in predictions]
