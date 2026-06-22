@@ -2,8 +2,8 @@
 
 Usage:
     python -m tests.e2e.test_datagen_and_eval_tools
-    python -m tests.e2e.test_datagen_and_eval_tools orchestration:2
-    python -m tests.e2e.test_datagen_and_eval_tools orchestration:2 --timeout=600
+    python -m tests.e2e.test_datagen_and_eval_tools orchestration:12
+    python -m tests.e2e.test_datagen_and_eval_tools orchestration:12 --timeout=600
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from tests.e2e.scenarios import DATAGEN_AND_EVAL_TOOLS_HELPDESK
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-_ORCHESTRATION_MODEL = "orchestration:2"
+_ORCHESTRATION_MODEL = "orchestration:12"
 _TIMEOUT_SECONDS = 0
 _remaining_args = []
 for arg in sys.argv[1:]:

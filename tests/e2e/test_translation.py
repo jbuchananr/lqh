@@ -4,16 +4,16 @@ Runs the full agent loop with an LLM-simulated human who wants to build
 a translation model that outputs JSON with 5 languages.
 
 Usage:
-    # Default orchestration model (orchestration:2), no timeout:
+    # Default orchestration model (orchestration:12), no timeout:
     python -m tests.e2e.test_translation
 
     # Compare orchestration models:
     python -m tests.e2e.test_translation orchestration:1
-    python -m tests.e2e.test_translation orchestration:2
+    python -m tests.e2e.test_translation orchestration:12
     python -m tests.e2e.test_translation orchestration:3
 
     # With timeout (seconds):
-    python -m tests.e2e.test_translation orchestration:2 --timeout=600
+    python -m tests.e2e.test_translation orchestration:12 --timeout=600
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 # CLI args
-_ORCHESTRATION_MODEL = "orchestration:2"
+_ORCHESTRATION_MODEL = "orchestration:12"
 _TIMEOUT_SECONDS = 0  # 0 = no timeout
 _remaining_args = []
 for arg in sys.argv[1:]:

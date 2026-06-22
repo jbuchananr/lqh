@@ -74,7 +74,7 @@ class E2EResult:
     total_tool_calls: int = 0
     skills_loaded: list[str] = field(default_factory=list)
     context_stats: ContextStats = field(default_factory=ContextStats)
-    orchestration_model: str = "orchestration:2"
+    orchestration_model: str = "orchestration:12"
     # Files created by scenario.seed_fn (relative paths). Judges should
     # exclude these because they are not the agent's work.
     seeded_files: set[str] = field(default_factory=set)
@@ -124,7 +124,7 @@ class E2EResult:
 class E2EHarness:
     """Runs the agent loop with an LLM-simulated human."""
 
-    def __init__(self, scenario: Scenario, orchestration_model: str = "orchestration:2") -> None:
+    def __init__(self, scenario: Scenario, orchestration_model: str = "orchestration:12") -> None:
         self.scenario = scenario
         self.orchestration_model = orchestration_model
         self.project_dir = Path(tempfile.mkdtemp(prefix=f"lqh_e2e_{scenario.name}_"))

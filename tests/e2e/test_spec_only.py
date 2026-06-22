@@ -2,8 +2,8 @@
 
 Usage:
     python -m tests.e2e.test_spec_only
-    python -m tests.e2e.test_spec_only orchestration:2
-    python -m tests.e2e.test_spec_only orchestration:2 --timeout=600
+    python -m tests.e2e.test_spec_only orchestration:12
+    python -m tests.e2e.test_spec_only orchestration:12 --timeout=600
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from tests.e2e.scenarios import SPEC_ONLY_EMAIL
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-_ORCHESTRATION_MODEL = "orchestration:2"
+_ORCHESTRATION_MODEL = "orchestration:12"
 _TIMEOUT_SECONDS = 0
 _remaining_args = []
 for arg in sys.argv[1:]:

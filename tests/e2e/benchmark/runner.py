@@ -5,7 +5,7 @@ an aggregate report.
 
 Usage:
     python -m tests.e2e.benchmark.runner
-    python -m tests.e2e.benchmark.runner --models orchestration:2,orchestration:3
+    python -m tests.e2e.benchmark.runner --models orchestration:12,orchestration:3
     python -m tests.e2e.benchmark.runner --categories datagen_pipeline,error_recovery
     python -m tests.e2e.benchmark.runner --timeout=900
     python -m tests.e2e.benchmark.runner --parallel=3
